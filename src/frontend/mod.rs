@@ -74,7 +74,7 @@ impl Frontend {
             }
         }
 
-        println!("plan: {:?}", plan);
+        // eprintln!("plan: {:?}", plan);
 
         Ok(plan)
     }
@@ -487,7 +487,7 @@ fn plan_match(
     let mut pg = parse_pattern_graph(pc, match_stmt)?;
 
     // Ok, now we have parsed the pattern into a full graph, time to start solving it
-    println!("built pg: {:?}", pg);
+    // eprintln!("built pg: {:?}", pg);
     // Start by picking one high-selectivity node
     let mut candidate_id = None;
     let mut solved_for_labelled_node = false;
