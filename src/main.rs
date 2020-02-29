@@ -2,8 +2,20 @@ fn main() -> anyhow::Result<()> {
     #[cfg(all(feature = "cli", feature = "gram"))]
     {
         use clap::{App, AppSettings};
+        use env_logger::{Builder, WriteStyle};
         use gqlite::gramdb::GramDatabase;
+        use log::LevelFilter;
         use std::fs::OpenOptions;
+        use std::io::Write;
+
+        let mut builder = Builder::new();
+        let logger = builder
+            .write_style(WriteStyle::Never)
+            .filter_module("gqlite", LevelFilter::Debug)
+            .format(|f, record| writeln!(f, "{}", record.args()))
+            .build();
+        log::set_boxed_logger(Box::new(logger))?;
+        log::set_max_level(LevelFilter::Debug);
 
         let matches = App::new("g")
             .version("0.0")
