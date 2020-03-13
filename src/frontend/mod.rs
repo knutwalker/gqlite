@@ -493,7 +493,6 @@ fn plan_match(
     let mut solved_for_labelled_node = false;
     for id in &pg.e_order {
         let mut candidate = pg.e.get_mut(id).unwrap();
-        candidate_id = Some(id);
         // Advanced algorithm: Pick first node with a label filter on it and call it an afternoon
         if !candidate.labels.is_empty() {
             if candidate.labels.len() > 1 {
@@ -507,6 +506,8 @@ fn plan_match(
             candidate.solved = true;
             solved_for_labelled_node = true;
             break;
+        } else if candidate_id.is_none() {
+            candidate_id = Some(id);
         }
     }
     if !solved_for_labelled_node {
