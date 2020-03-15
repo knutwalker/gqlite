@@ -57,12 +57,13 @@ pub struct BackendDesc {
 
 impl BackendDesc {
     pub fn new(functions: Vec<FuncSignature>) -> BackendDesc {
-        let mut aggregates = HashSet::new();
-        for f in &functions {
-            if let FuncType::Aggregating = f.func_type {
-                aggregates.insert(f.name);
-            }
-        }
+        let aggregates = functions
+            .iter()
+            .filter_map(|f| match f.func_type {
+                FuncType::Aggregating => Some(f.name),
+                _ => None,
+            })
+            .collect();
         BackendDesc {
             functions,
             aggregates,
