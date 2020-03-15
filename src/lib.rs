@@ -44,7 +44,7 @@ impl<T: Backend> Database<T> {
     }
 
     pub fn run(&mut self, query_str: &str, cursor: &mut Cursor<T>) -> Result<()> {
-        let plan = self.frontend.plan(query_str)?;
+        let plan = self.frontend.plan(&self.backend, query_str)?;
         self.backend.eval(plan, &mut cursor.inner)
     }
 }

@@ -23,10 +23,17 @@ pub trait Backend: Debug {
 
     fn tokens(&self) -> Rc<RefCell<Tokens>>;
 
-    // Evaluate a logical plan and set the cursor up to process the result
+    fn tokenize(&self, contents: &str) -> Token {
+        self.tokens().borrow_mut().tokenize(contents)
+    }
+
+    // Evaluate a logical plan and run it on the cursor
     fn eval(&mut self, plan: LogicalPlan, cursor: &mut Self::Cursor) -> Result<()>;
 
-    // Describe this backend for the frontends benefit
+    // Describe this backend for the frontends benefit; intention is that this will
+    // eventually contain things like listings of indexes etc. Once it does, it'll also need to
+    // include a digest or a version that gets embedded with the planned query, because the query
+    // plan may become invalid if indexes or constraints are added and removed.
     fn describe(&self) -> Result<BackendDesc, Error>;
 }
 

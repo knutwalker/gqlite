@@ -5,7 +5,7 @@
 
 use pest::Parser;
 
-use crate::backend::{BackendDesc, Token, Tokens};
+use crate::backend::{Backend, BackendDesc, Token, Tokens};
 use crate::Slot;
 use anyhow::Result;
 use pest::iterators::Pair;
@@ -31,23 +31,22 @@ pub struct Frontend {
 }
 
 impl Frontend {
-    pub fn plan(&self, query_str: &str) -> Result<LogicalPlan> {
+    pub fn plan(&self, backend: &impl Backend, query_str: &str) -> Result<LogicalPlan> {
         self.plan_in_context(
             query_str,
             &mut PlanningContext {
                 slots: Default::default(),
                 anon_rel_seq: 0,
                 anon_node_seq: 0,
-                tokens: Rc::clone(&self.tokens),
-                backend_desc: &self.backend_desc,
+                backend,
             },
         )
     }
 
-    pub fn plan_in_context<'i, 'pc>(
+    pub fn plan_in_context<'i, 'pc, T: Backend>(
         &self,
         query_str: &str,
-        pc: &'i mut PlanningContext<'pc>,
+        pc: &'i mut PlanningContext<'pc, T>,
     ) -> Result<LogicalPlan> {
         let query = CypherParser::parse(Rule::query, &query_str)?
             .next()
@@ -180,26 +179,19 @@ pub struct Projection {
 }
 
 #[derive(Debug)]
-pub struct PlanningContext<'i> {
+pub struct PlanningContext<'i, T> {
     // Mapping of names used in the query string to slots in the row being processed
     slots: HashMap<Token, usize>,
 
-    // TODO is there some nicer way to do this than Rc+RefCell?
-    tokens: Rc<RefCell<Tokens>>,
-
-    // Description of the backend this query is being planned for; intention is that this will
-    // eventually contain things like listings of indexes etc. Once it does, it'll also need to
-    // include a digest or a version that gets embedded with the planned query, because the query
-    // plan may become invalid if indexes or constraints are added and removed.
-    backend_desc: &'i BackendDesc,
+    backend: &'i T,
 
     anon_rel_seq: u32,
     anon_node_seq: u32,
 }
 
-impl<'i> PlanningContext<'i> {
+impl<'i, T: Backend> PlanningContext<'i, T> {
     fn tokenize(&mut self, contents: &str) -> Token {
-        self.tokens.borrow_mut().tokenize(contents)
+        self.backend.tokenize(contents)
     }
 
     // Is the given token a value that we know about already?
@@ -233,8 +225,8 @@ impl<'i> PlanningContext<'i> {
     }
 }
 
-fn plan_create(
-    pc: &mut PlanningContext,
+fn plan_create<T: Backend>(
+    pc: &mut PlanningContext<T>,
     src: LogicalPlan,
     create_stmt: Pair<Rule>,
 ) -> Result<LogicalPlan> {
@@ -304,8 +296,8 @@ pub struct RelSpec {
     props: Vec<MapEntryExpr>,
 }
 
-fn plan_unwind(
-    pc: &mut PlanningContext,
+fn plan_unwind<T: Backend>(
+    pc: &mut PlanningContext<T>,
     src: LogicalPlan,
     unwind_stmt: Pair<Rule>,
 ) -> Result<LogicalPlan> {
@@ -328,16 +320,17 @@ fn plan_unwind(
     });
 }
 
-fn plan_return(
-    pc: &mut PlanningContext,
+fn plan_return<T: Backend>(
+    pc: &mut PlanningContext<T>,
     src: LogicalPlan,
     return_stmt: Pair<Rule>,
 ) -> Result<LogicalPlan> {
     let mut parts = return_stmt.into_inner();
+    let backend_desc = pc.backend.describe()?;
 
     let (is_aggregate, projections) = parts
         .next()
-        .map(|p| plan_return_projections(pc, p))
+        .map(|p| plan_return_projections(pc, &backend_desc, p))
         .expect("RETURN must start with projections")?;
     if !is_aggregate {
         return Ok(LogicalPlan::Return {
@@ -367,7 +360,7 @@ fn plan_return(
             alias: projection.alias,
             dst: agg_projection_slot,
         });
-        if projection.expr.is_aggregating(&pc.backend_desc.aggregates) {
+        if projection.expr.is_aggregating(&backend_desc.aggregates) {
             aggregations.push((projection.expr, pc.get_or_alloc_slot(projection.alias)));
         } else {
             grouping.push((projection.expr, pc.get_or_alloc_slot(projection.alias)));
@@ -385,8 +378,9 @@ fn plan_return(
 }
 
 // The bool return here is nasty, refactor, maybe make into a struct?
-fn plan_return_projections(
-    pc: &mut PlanningContext,
+fn plan_return_projections<T: Backend>(
+    pc: &mut PlanningContext<T>,
+    backend_desc: &BackendDesc,
     projections: Pair<Rule>,
 ) -> Result<(bool, Vec<Projection>)> {
     let mut out = Vec::new();
@@ -397,7 +391,7 @@ fn plan_return_projections(
             let mut parts = projection.into_inner();
             let expr = parts.next().map(|p| plan_expr(pc, p)).unwrap()?;
             contains_aggregations =
-                contains_aggregations || expr.is_aggregating(&pc.backend_desc.aggregates);
+                contains_aggregations || expr.is_aggregating(&backend_desc.aggregates);
             let alias = parts
                 .next()
                 .and_then(|p| match p.as_rule() {
@@ -494,8 +488,8 @@ impl PatternGraph {
     }
 }
 
-fn plan_match(
-    pc: &mut PlanningContext,
+fn plan_match<T: Backend>(
+    pc: &mut PlanningContext<T>,
     src: LogicalPlan,
     match_stmt: Pair<Rule>,
 ) -> Result<LogicalPlan> {
@@ -638,7 +632,10 @@ fn plan_match(
     Ok(plan)
 }
 
-fn parse_pattern_graph(pc: &mut PlanningContext, patterns: Pair<Rule>) -> Result<PatternGraph> {
+fn parse_pattern_graph<T: Backend>(
+    pc: &mut PlanningContext<T>,
+    patterns: Pair<Rule>,
+) -> Result<PatternGraph> {
     let mut pg: PatternGraph = PatternGraph::default();
 
     for part in patterns.into_inner() {
@@ -687,7 +684,10 @@ fn parse_pattern_graph(pc: &mut PlanningContext, patterns: Pair<Rule>) -> Result
 }
 
 // Figures out what step we need to find the specified node
-fn parse_pattern_node(pc: &mut PlanningContext, pattern_node: Pair<Rule>) -> Result<PatternNode> {
+fn parse_pattern_node<T: Backend>(
+    pc: &mut PlanningContext<T>,
+    pattern_node: Pair<Rule>,
+) -> Result<PatternNode> {
     let mut identifier = None;
     let mut labels = Vec::new();
     let mut props = Vec::new();
@@ -718,8 +718,8 @@ fn parse_pattern_node(pc: &mut PlanningContext, pattern_node: Pair<Rule>) -> Res
     })
 }
 
-fn parse_pattern_rel(
-    pc: &mut PlanningContext,
+fn parse_pattern_rel<T: Backend>(
+    pc: &mut PlanningContext<T>,
     left_node: Token,
     pattern_rel: Pair<Rule>,
 ) -> Result<PatternRel> {
@@ -758,8 +758,8 @@ fn parse_pattern_rel(
     })
 }
 
-fn parse_map_expression(
-    pc: &mut PlanningContext,
+fn parse_map_expression<T: Backend>(
+    pc: &mut PlanningContext<T>,
     map_expr: Pair<Rule>,
 ) -> Result<Vec<MapEntryExpr>> {
     let mut out = Vec::new();
@@ -788,10 +788,74 @@ fn parse_map_expression(
 }
 
 #[cfg(test)]
+mod test_backend {
+    use super::*;
+    use crate::backend::{BackendCursor, BackendDesc, FuncSignature, FuncType, Token, Tokens};
+    use crate::{Row, Type};
+    use anyhow::Result;
+    use std::cell::RefCell;
+    use std::rc::Rc;
+
+    impl BackendCursor for () {
+        fn next(&mut self) -> Result<Option<&Row>> {
+            Ok(None)
+        }
+    }
+
+
+    #[derive(Debug)]
+    pub(crate) struct TestBackend {
+        tokens: Rc<RefCell<Tokens>>,
+        fn_count: Token,
+        tok_expr: Token,
+    }
+
+    impl TestBackend {
+        pub(crate) fn new() -> Self {
+            let mut tokens = Tokens::new();
+            let tok_expr = tokens.tokenize("expr");
+            let fn_count = tokens.tokenize("count");
+            let tokens = Rc::new(RefCell::new(tokens));
+            TestBackend {
+                tokens,
+                fn_count,
+                tok_expr,
+            }
+        }
+    }
+
+    impl Backend for TestBackend {
+        type Cursor = ();
+
+        fn new_cursor(&mut self) -> Self::Cursor {
+            ()
+        }
+
+        fn tokens(&self) -> Rc<RefCell<Tokens>> {
+            Rc::clone(&self.tokens)
+        }
+
+        fn eval(&mut self, _plan: LogicalPlan, _cursor: &mut Self::Cursor) -> Result<()> {
+            Ok(())
+        }
+
+        fn describe(&self) -> Result<BackendDesc> {
+            let backend_desc = BackendDesc::new(vec![FuncSignature {
+                func_type: FuncType::Aggregating,
+                name: self.fn_count,
+                returns: Type::Integer,
+                args: vec![(self.tok_expr, Type::Any)],
+            }]);
+            Ok(backend_desc)
+        }
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
-    use crate::backend::{BackendDesc, FuncSignature, FuncType, Token, Tokens};
-    use crate::Type;
+    use super::test_backend::*;
+    use crate::backend::{Token, Tokens};
     use anyhow::Result;
     use std::cell::RefCell;
     use std::collections::HashMap;
@@ -816,26 +880,17 @@ mod tests {
     }
 
     fn plan(q: &str) -> Result<PlanArtifacts> {
-        let tokens = Rc::new(RefCell::new(Tokens::new()));
-        let tok_expr = tokens.borrow_mut().tokenize("expr");
-        let fn_count = tokens.borrow_mut().tokenize("count");
-        let backend_desc = BackendDesc::new(vec![FuncSignature {
-            func_type: FuncType::Aggregating,
-            name: fn_count,
-            returns: Type::Integer,
-            args: vec![(tok_expr, Type::Any)],
-        }]);
+        let backend = TestBackend::new();
 
         let frontend = Frontend {
-            tokens: Rc::clone(&tokens),
-            backend_desc: BackendDesc::new(vec![]),
+            tokens: backend.tokens(),
+            backend_desc: backend.describe()?,
         };
         let mut pc = PlanningContext {
             slots: Default::default(),
             anon_rel_seq: 0,
             anon_node_seq: 0,
-            tokens: Rc::clone(&tokens),
-            backend_desc: &backend_desc,
+            backend: &backend,
         };
         let plan = frontend.plan_in_context(q, &mut pc);
 
@@ -843,7 +898,7 @@ mod tests {
             Ok(plan) => Ok(PlanArtifacts {
                 plan,
                 slots: pc.slots,
-                tokens: Rc::clone(&tokens),
+                tokens: backend.tokens(),
             }),
             Err(e) => {
                 println!("{}", e);

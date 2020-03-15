@@ -1,7 +1,7 @@
 // This module contains our definition of expressions, including code to convert parse streams
 // to expressions.
 
-use crate::backend::Token;
+use crate::backend::{Backend, Token};
 use crate::frontend::{PlanningContext, Result, Rule};
 use crate::Slot;
 use pest::iterators::Pair;
@@ -93,7 +93,10 @@ pub struct MapEntryExpr {
     pub val: Expr,
 }
 
-pub(super) fn plan_expr(pc: &mut PlanningContext, expression: Pair<Rule>) -> Result<Expr> {
+pub(super) fn plan_expr<T: Backend>(
+    pc: &mut PlanningContext<T>,
+    expression: Pair<Rule>,
+) -> Result<Expr> {
     let mut or_expressions = Vec::new();
     for inner in expression.into_inner() {
         match inner.as_rule() {
@@ -119,7 +122,7 @@ pub(super) fn plan_expr(pc: &mut PlanningContext, expression: Pair<Rule>) -> Res
     }
 }
 
-fn plan_term(pc: &mut PlanningContext, term: Pair<Rule>) -> Result<Expr> {
+fn plan_term<T: Backend>(pc: &mut PlanningContext<T>, term: Pair<Rule>) -> Result<Expr> {
     match term.as_rule() {
         Rule::string => {
             let content = term
@@ -211,9 +214,9 @@ fn plan_term(pc: &mut PlanningContext, term: Pair<Rule>) -> Result<Expr> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::backend::{BackendDesc, FuncSignature, FuncType, Token, Tokens};
+    use super::super::test_backend::*;
+    use crate::backend::{Token, Tokens};
     use crate::frontend::{Frontend, LogicalPlan};
-    use crate::Type;
     use anyhow::Result;
     use std::cell::RefCell;
     use std::collections::HashMap;
@@ -228,27 +231,19 @@ mod tests {
     }
 
     fn plan(q: &str) -> Result<PlanArtifacts> {
-        let tokens = Rc::new(RefCell::new(Tokens::new()));
-        let tok_expr = tokens.borrow_mut().tokenize("expr");
-        let fn_count = tokens.borrow_mut().tokenize("count");
-        let backend_desc = BackendDesc::new(vec![FuncSignature {
-            func_type: FuncType::Aggregating,
-            name: fn_count,
-            returns: Type::Integer,
-            args: vec![(tok_expr, Type::Any)],
-        }]);
+        let backend = TestBackend::new();
 
         let frontend = Frontend {
-            tokens: Rc::clone(&tokens),
-            backend_desc: BackendDesc::new(vec![]),
+            tokens: backend.tokens(),
+            backend_desc: backend.describe()?,
         };
         let mut pc = PlanningContext {
             slots: Default::default(),
             anon_rel_seq: 0,
             anon_node_seq: 0,
-            tokens: Rc::clone(&tokens),
-            backend_desc: &backend_desc,
+            backend: &backend,
         };
+
         let plan = frontend.plan_in_context(&format!("RETURN {}", q), &mut pc);
 
         if let Ok(LogicalPlan::Return {
@@ -259,7 +254,7 @@ mod tests {
             return Ok(PlanArtifacts {
                 expr: projections[0].expr.clone(),
                 slots: pc.slots,
-                tokens: Rc::clone(&tokens),
+                tokens: backend.tokens(),
             });
         } else {
             return Err(anyhow!("Expected RETURN plan, got: {:?}", plan?));
