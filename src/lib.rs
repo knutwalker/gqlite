@@ -17,16 +17,11 @@ use frontend::Frontend;
 #[derive(Debug)]
 pub struct Database<T: Backend> {
     backend: T,
-    frontend: Frontend,
 }
 
 impl<T: Backend> Database<T> {
     pub fn with_backend(backend: T) -> Result<Database<T>> {
-        let frontend = Frontend {
-            tokens: backend.tokens(),
-            backend_desc: backend.describe()?,
-        };
-        Ok(Database { backend, frontend })
+        Ok(Database { backend })
     }
 
     // TODO this is a side-effect, presumably, of me being bad at rust.
@@ -44,7 +39,7 @@ impl<T: Backend> Database<T> {
     }
 
     pub fn run(&mut self, query_str: &str, cursor: &mut Cursor<T>) -> Result<()> {
-        let plan = self.frontend.plan(&self.backend, query_str)?;
+        let plan = Frontend::plan(&self.backend, query_str)?;
         self.backend.eval(plan, &mut cursor.inner)
     }
 }

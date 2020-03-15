@@ -5,15 +5,13 @@
 
 use pest::Parser;
 
-use crate::backend::{Backend, BackendDesc, Token, Tokens};
+use crate::backend::{Backend, BackendDesc, Token};
 use crate::Slot;
 use anyhow::Result;
 use pest::iterators::Pair;
-use std::cell::RefCell;
 use std::collections::hash_map::Entry;
 use std::collections::HashMap;
 use std::fmt::Debug;
-use std::rc::Rc;
 
 mod expr;
 
@@ -25,29 +23,28 @@ pub use expr::{Expr, MapEntryExpr};
 pub struct CypherParser;
 
 #[derive(Debug)]
-pub struct Frontend {
-    pub tokens: Rc<RefCell<Tokens>>,
-    pub backend_desc: BackendDesc,
+pub struct Frontend<'a, T> {
+    // Mapping of names used in the query string to slots in the row being processed
+    slots: HashMap<Token, usize>,
+
+    backend: &'a T,
+
+    anon_rel_seq: u32,
+    anon_node_seq: u32,
 }
 
-impl Frontend {
-    pub fn plan(&self, backend: &impl Backend, query_str: &str) -> Result<LogicalPlan> {
-        self.plan_in_context(
-            query_str,
-            &mut PlanningContext {
-                slots: Default::default(),
-                anon_rel_seq: 0,
-                anon_node_seq: 0,
-                backend,
-            },
-        )
+impl<'a, T: Backend> Frontend<'a, T> {
+    pub fn plan(backend: &'a T, query_str: &str) -> Result<LogicalPlan> {
+        let mut frontend = Frontend {
+            slots: Default::default(),
+            anon_rel_seq: 0,
+            anon_node_seq: 0,
+            backend,
+        };
+        frontend.plan_in_context(query_str)
     }
 
-    pub fn plan_in_context<'i, 'pc, T: Backend>(
-        &self,
-        query_str: &str,
-        pc: &'i mut PlanningContext<'pc, T>,
-    ) -> Result<LogicalPlan> {
+    pub fn plan_in_context(&mut self, query_str: &str) -> Result<LogicalPlan> {
         let query = CypherParser::parse(Rule::query, &query_str)?
             .next()
             .unwrap(); // get and unwrap the `query` rule; never fails
@@ -57,16 +54,16 @@ impl Frontend {
         for stmt in query.into_inner() {
             match stmt.as_rule() {
                 Rule::match_stmt => {
-                    plan = plan_match(pc, plan, stmt)?;
+                    plan = plan_match(self, plan, stmt)?;
                 }
                 Rule::unwind_stmt => {
-                    plan = plan_unwind(pc, plan, stmt)?;
+                    plan = plan_unwind(self, plan, stmt)?;
                 }
                 Rule::create_stmt => {
-                    plan = plan_create(pc, plan, stmt)?;
+                    plan = plan_create(self, plan, stmt)?;
                 }
                 Rule::return_stmt => {
-                    plan = plan_return(pc, plan, stmt)?;
+                    plan = plan_return(self, plan, stmt)?;
                 }
                 Rule::EOI => (),
                 _ => unreachable!(),
@@ -76,6 +73,40 @@ impl Frontend {
         log::debug!("plan: {:?}", plan);
 
         Ok(plan)
+    }
+
+    fn tokenize(&mut self, contents: &str) -> Token {
+        self.backend.tokenize(contents)
+    }
+
+    // Is the given token a value that we know about already?
+    // This is used to determine if entities in CREATE refer to existing bound identifiers
+    // or if they are introducing new entities to be created.
+    pub fn is_bound(&self, tok: Token) -> bool {
+        self.slots.contains_key(&tok)
+    }
+
+    pub fn get_or_alloc_slot(&mut self, tok: Token) -> usize {
+        match self.slots.get(&tok) {
+            Some(slot) => *slot,
+            None => {
+                let slot = self.slots.len();
+                self.slots.insert(tok, slot);
+                slot
+            }
+        }
+    }
+
+    pub fn new_anon_rel(&mut self) -> Token {
+        let seq = self.anon_rel_seq;
+        self.anon_rel_seq += 1;
+        self.tokenize(&format!("AnonRel#{}", seq))
+    }
+
+    pub fn new_anon_node(&mut self) -> Token {
+        let seq = self.anon_node_seq;
+        self.anon_node_seq += 1;
+        self.tokenize(&format!("AnonNode#{}", seq))
     }
 }
 
@@ -178,70 +209,23 @@ pub struct Projection {
     pub dst: Slot,
 }
 
-#[derive(Debug)]
-pub struct PlanningContext<'i, T> {
-    // Mapping of names used in the query string to slots in the row being processed
-    slots: HashMap<Token, usize>,
-
-    backend: &'i T,
-
-    anon_rel_seq: u32,
-    anon_node_seq: u32,
-}
-
-impl<'i, T: Backend> PlanningContext<'i, T> {
-    fn tokenize(&mut self, contents: &str) -> Token {
-        self.backend.tokenize(contents)
-    }
-
-    // Is the given token a value that we know about already?
-    // This is used to determine if entities in CREATE refer to existing bound identifiers
-    // or if they are introducing new entities to be created.
-    pub fn is_bound(&self, tok: Token) -> bool {
-        self.slots.contains_key(&tok)
-    }
-
-    pub fn get_or_alloc_slot(&mut self, tok: Token) -> usize {
-        match self.slots.get(&tok) {
-            Some(slot) => *slot,
-            None => {
-                let slot = self.slots.len();
-                self.slots.insert(tok, slot);
-                slot
-            }
-        }
-    }
-
-    pub fn new_anon_rel(&mut self) -> Token {
-        let seq = self.anon_rel_seq;
-        self.anon_rel_seq += 1;
-        self.tokenize(&format!("AnonRel#{}", seq))
-    }
-
-    pub fn new_anon_node(&mut self) -> Token {
-        let seq = self.anon_node_seq;
-        self.anon_node_seq += 1;
-        self.tokenize(&format!("AnonNode#{}", seq))
-    }
-}
-
 fn plan_create<T: Backend>(
-    pc: &mut PlanningContext<T>,
+    fe: &mut Frontend<T>,
     src: LogicalPlan,
     create_stmt: Pair<Rule>,
 ) -> Result<LogicalPlan> {
-    let pg = parse_pattern_graph(pc, create_stmt)?;
+    let pg = parse_pattern_graph(fe, create_stmt)?;
 
     let mut nodes = Vec::new();
     let mut rels = Vec::new();
     for (_, node) in pg.v {
-        if pc.is_bound(node.identifier) {
+        if fe.is_bound(node.identifier) {
             // We already know about this node, it isn't meant to be created. ie
             // MATCH (n) CREATE (n)-[:NEWREL]->(newnode)
             continue;
         }
         nodes.push(NodeSpec {
-            slot: pc.get_or_alloc_slot(node.identifier),
+            slot: fe.get_or_alloc_slot(node.identifier),
             labels: node.labels,
             props: node.props,
         });
@@ -251,19 +235,19 @@ fn plan_create<T: Backend>(
         match rel.dir {
             Some(Dir::Out) => {
                 rels.push(RelSpec {
-                    slot: pc.get_or_alloc_slot(rel.identifier),
+                    slot: fe.get_or_alloc_slot(rel.identifier),
                     rel_type: rel.rel_type,
-                    start_node_slot: pc.get_or_alloc_slot(rel.left_node),
-                    end_node_slot: pc.get_or_alloc_slot(rel.right_node.unwrap()),
+                    start_node_slot: fe.get_or_alloc_slot(rel.left_node),
+                    end_node_slot: fe.get_or_alloc_slot(rel.right_node.unwrap()),
                     props: rel.props,
                 });
             }
             Some(Dir::In) => {
                 rels.push(RelSpec {
-                    slot: pc.get_or_alloc_slot(rel.identifier),
+                    slot: fe.get_or_alloc_slot(rel.identifier),
                     rel_type: rel.rel_type,
-                    start_node_slot: pc.get_or_alloc_slot(rel.right_node.unwrap()),
-                    end_node_slot: pc.get_or_alloc_slot(rel.left_node),
+                    start_node_slot: fe.get_or_alloc_slot(rel.right_node.unwrap()),
+                    end_node_slot: fe.get_or_alloc_slot(rel.left_node),
                     props: vec![],
                 });
             }
@@ -297,21 +281,21 @@ pub struct RelSpec {
 }
 
 fn plan_unwind<T: Backend>(
-    pc: &mut PlanningContext<T>,
+    fe: &mut Frontend<T>,
     src: LogicalPlan,
     unwind_stmt: Pair<Rule>,
 ) -> Result<LogicalPlan> {
     let mut parts = unwind_stmt.into_inner();
 
     let list_item = parts.next().expect("UNWIND must contain a list expression");
-    let list_expr = plan_expr(pc, list_item)?;
-    let alias_token = pc.tokenize(
+    let list_expr = plan_expr(fe, list_item)?;
+    let alias_token = fe.tokenize(
         parts
             .next()
             .expect("UNWIND must contain an AS alias")
             .as_str(),
     );
-    let alias = pc.get_or_alloc_slot(alias_token);
+    let alias = fe.get_or_alloc_slot(alias_token);
 
     return Ok(LogicalPlan::Unwind {
         src: Box::new(src),
@@ -321,16 +305,16 @@ fn plan_unwind<T: Backend>(
 }
 
 fn plan_return<T: Backend>(
-    pc: &mut PlanningContext<T>,
+    fe: &mut Frontend<T>,
     src: LogicalPlan,
     return_stmt: Pair<Rule>,
 ) -> Result<LogicalPlan> {
     let mut parts = return_stmt.into_inner();
-    let backend_desc = pc.backend.describe()?;
+    let backend_desc = fe.backend.describe()?;
 
     let (is_aggregate, projections) = parts
         .next()
-        .map(|p| plan_return_projections(pc, &backend_desc, p))
+        .map(|p| plan_return_projections(fe, &backend_desc, p))
         .expect("RETURN must start with projections")?;
     if !is_aggregate {
         return Ok(LogicalPlan::Return {
@@ -354,16 +338,16 @@ fn plan_return<T: Backend>(
     // the user asked values to be returned in
     let mut aggregation_projections = Vec::new();
     for projection in projections {
-        let agg_projection_slot = pc.get_or_alloc_slot(projection.alias);
+        let agg_projection_slot = fe.get_or_alloc_slot(projection.alias);
         aggregation_projections.push(Projection {
             expr: Expr::Slot(agg_projection_slot),
             alias: projection.alias,
             dst: agg_projection_slot,
         });
         if projection.expr.is_aggregating(&backend_desc.aggregates) {
-            aggregations.push((projection.expr, pc.get_or_alloc_slot(projection.alias)));
+            aggregations.push((projection.expr, fe.get_or_alloc_slot(projection.alias)));
         } else {
-            grouping.push((projection.expr, pc.get_or_alloc_slot(projection.alias)));
+            grouping.push((projection.expr, fe.get_or_alloc_slot(projection.alias)));
         }
     }
 
@@ -379,7 +363,7 @@ fn plan_return<T: Backend>(
 
 // The bool return here is nasty, refactor, maybe make into a struct?
 fn plan_return_projections<T: Backend>(
-    pc: &mut PlanningContext<T>,
+    fe: &mut Frontend<T>,
     backend_desc: &BackendDesc,
     projections: Pair<Rule>,
 ) -> Result<(bool, Vec<Projection>)> {
@@ -389,16 +373,16 @@ fn plan_return_projections<T: Backend>(
         if let Rule::projection = projection.as_rule() {
             let default_alias = projection.as_str();
             let mut parts = projection.into_inner();
-            let expr = parts.next().map(|p| plan_expr(pc, p)).unwrap()?;
+            let expr = parts.next().map(|p| plan_expr(fe, p)).unwrap()?;
             contains_aggregations =
                 contains_aggregations || expr.is_aggregating(&backend_desc.aggregates);
             let alias = parts
                 .next()
                 .and_then(|p| match p.as_rule() {
-                    Rule::id => Some(pc.tokenize(p.as_str())),
+                    Rule::id => Some(fe.tokenize(p.as_str())),
                     _ => None,
                 })
-                .unwrap_or_else(|| pc.tokenize(default_alias));
+                .unwrap_or_else(|| fe.tokenize(default_alias));
             out.push(Projection {
                 expr,
                 alias,
@@ -406,7 +390,7 @@ fn plan_return_projections<T: Backend>(
                 //      projections that just rename stuff (eg. WITH blah as x); we should
                 //      consider making expr in Projection Optional, so it can be used for pure
                 //      renaming, is benchmarking shows that's helpful.
-                dst: pc.get_or_alloc_slot(alias),
+                dst: fe.get_or_alloc_slot(alias),
             });
         }
     }
@@ -489,7 +473,7 @@ impl PatternGraph {
 }
 
 fn plan_match<T: Backend>(
-    pc: &mut PlanningContext<T>,
+    fe: &mut Frontend<T>,
     src: LogicalPlan,
     match_stmt: Pair<Rule>,
 ) -> Result<LogicalPlan> {
@@ -514,7 +498,7 @@ fn plan_match<T: Backend>(
     }
 
     let mut plan = src;
-    let mut pg = parse_pattern_graph(pc, match_stmt)?;
+    let mut pg = parse_pattern_graph(fe, match_stmt)?;
 
     // Ok, now we have parsed the pattern into a full graph, time to start solving it
     log::debug!("built pg: {:?}", pg);
@@ -530,7 +514,7 @@ fn plan_match<T: Backend>(
             }
             plan = LogicalPlan::NodeScan {
                 src: Box::new(plan),
-                slot: pc.get_or_alloc_slot(*id),
+                slot: fe.get_or_alloc_slot(*id),
                 labels: candidate.labels.first().cloned(),
             };
             candidate.solved = true;
@@ -548,7 +532,7 @@ fn plan_match<T: Backend>(
             }
             plan = LogicalPlan::NodeScan {
                 src: Box::new(plan),
-                slot: pc.get_or_alloc_slot(*candidate_id),
+                slot: fe.get_or_alloc_slot(*candidate_id),
                 labels: candidate.labels.first().cloned(),
             };
             candidate.solved = true;
@@ -580,11 +564,11 @@ fn plan_match<T: Backend>(
                 right_node.solved = true;
                 rel.solved = true;
                 solved_any = true;
-                let dst = pc.get_or_alloc_slot(right_id);
+                let dst = fe.get_or_alloc_slot(right_id);
                 let expand = LogicalPlan::Expand {
                     src: Box::new(plan),
-                    src_slot: pc.get_or_alloc_slot(left_id),
-                    rel_slot: pc.get_or_alloc_slot(rel.identifier),
+                    src_slot: fe.get_or_alloc_slot(left_id),
+                    rel_slot: fe.get_or_alloc_slot(rel.identifier),
                     dst_slot: dst,
                     rel_type: rel.rel_type,
                     dir: rel.dir,
@@ -596,11 +580,11 @@ fn plan_match<T: Backend>(
                 left_node.solved = true;
                 rel.solved = true;
                 solved_any = true;
-                let dst = pc.get_or_alloc_slot(left_id);
+                let dst = fe.get_or_alloc_slot(left_id);
                 let expand = LogicalPlan::Expand {
                     src: Box::new(plan),
-                    src_slot: pc.get_or_alloc_slot(right_id),
-                    rel_slot: pc.get_or_alloc_slot(rel.identifier),
+                    src_slot: fe.get_or_alloc_slot(right_id),
+                    rel_slot: fe.get_or_alloc_slot(rel.identifier),
                     dst_slot: dst,
                     rel_type: rel.rel_type,
                     dir: rel.dir.map(Dir::reverse),
@@ -633,7 +617,7 @@ fn plan_match<T: Backend>(
 }
 
 fn parse_pattern_graph<T: Backend>(
-    pc: &mut PlanningContext<T>,
+    fe: &mut Frontend<T>,
     patterns: Pair<Rule>,
 ) -> Result<PatternGraph> {
     let mut pg: PatternGraph = PatternGraph::default();
@@ -647,7 +631,7 @@ fn parse_pattern_graph<T: Backend>(
                 for segment in part.into_inner() {
                     match segment.as_rule() {
                         Rule::node => {
-                            let prior_node = parse_pattern_node(pc, segment)?;
+                            let prior_node = parse_pattern_node(fe, segment)?;
                             prior_node_id = Some(prior_node.identifier);
                             pg.merge_node(prior_node);
                             if let Some(mut rel) = prior_rel {
@@ -658,7 +642,7 @@ fn parse_pattern_graph<T: Backend>(
                         }
                         Rule::rel => {
                             prior_rel = Some(parse_pattern_rel(
-                                pc,
+                                fe,
                                 prior_node_id.expect("pattern rel must be preceded by node"),
                                 segment,
                             )?);
@@ -670,7 +654,7 @@ fn parse_pattern_graph<T: Backend>(
             }
             Rule::where_clause => {
                 pg.predicate = Some(plan_expr(
-                    pc,
+                    fe,
                     part.into_inner()
                         .next()
                         .expect("where clause must contain a predicate"),
@@ -685,7 +669,7 @@ fn parse_pattern_graph<T: Backend>(
 
 // Figures out what step we need to find the specified node
 fn parse_pattern_node<T: Backend>(
-    pc: &mut PlanningContext<T>,
+    fe: &mut Frontend<T>,
     pattern_node: Pair<Rule>,
 ) -> Result<PatternNode> {
     let mut identifier = None;
@@ -693,20 +677,20 @@ fn parse_pattern_node<T: Backend>(
     let mut props = Vec::new();
     for part in pattern_node.into_inner() {
         match part.as_rule() {
-            Rule::id => identifier = Some(pc.tokenize(part.as_str())),
+            Rule::id => identifier = Some(fe.tokenize(part.as_str())),
             Rule::label => {
                 for label in part.into_inner() {
-                    labels.push(pc.tokenize(label.as_str()));
+                    labels.push(fe.tokenize(label.as_str()));
                 }
             }
             Rule::map => {
-                props = parse_map_expression(pc, part)?;
+                props = parse_map_expression(fe, part)?;
             }
             _ => panic!("don't know how to handle: {}", part),
         }
     }
 
-    let id = identifier.unwrap_or_else(|| pc.new_anon_node());
+    let id = identifier.unwrap_or_else(|| fe.new_anon_node());
     labels.sort_unstable();
     labels.dedup();
 
@@ -719,7 +703,7 @@ fn parse_pattern_node<T: Backend>(
 }
 
 fn parse_pattern_rel<T: Backend>(
-    pc: &mut PlanningContext<T>,
+    fe: &mut Frontend<T>,
     left_node: Token,
     pattern_rel: Pair<Rule>,
 ) -> Result<PatternRel> {
@@ -729,8 +713,8 @@ fn parse_pattern_rel<T: Backend>(
     let mut props = Vec::new();
     for part in pattern_rel.into_inner() {
         match part.as_rule() {
-            Rule::id => identifier = Some(pc.tokenize(part.as_str())),
-            Rule::rel_type => rel_type = Some(pc.tokenize(part.as_str())),
+            Rule::id => identifier = Some(fe.tokenize(part.as_str())),
+            Rule::rel_type => rel_type = Some(fe.tokenize(part.as_str())),
             Rule::left_arrow => dir = Some(Dir::In),
             Rule::right_arrow => {
                 if dir.is_some() {
@@ -739,14 +723,14 @@ fn parse_pattern_rel<T: Backend>(
                 dir = Some(Dir::Out)
             }
             Rule::map => {
-                props = parse_map_expression(pc, part)?;
+                props = parse_map_expression(fe, part)?;
             }
             _ => unreachable!(),
         }
     }
     // TODO don't use this empty identifier here
-    let id = identifier.unwrap_or_else(|| pc.new_anon_rel());
-    let rt = rel_type.map_or_else(|| RelType::Anon(pc.new_anon_rel()), RelType::Defined);
+    let id = identifier.unwrap_or_else(|| fe.new_anon_rel());
+    let rt = rel_type.map_or_else(|| RelType::Anon(fe.new_anon_rel()), RelType::Defined);
     Ok(PatternRel {
         left_node,
         right_node: None,
@@ -759,7 +743,7 @@ fn parse_pattern_rel<T: Backend>(
 }
 
 fn parse_map_expression<T: Backend>(
-    pc: &mut PlanningContext<T>,
+    fe: &mut Frontend<T>,
     map_expr: Pair<Rule>,
 ) -> Result<Vec<MapEntryExpr>> {
     let mut out = Vec::new();
@@ -770,12 +754,12 @@ fn parse_map_expression<T: Backend>(
                 let id_token = pair_iter
                     .next()
                     .expect("Map pair must contain an identifier");
-                let identifier = pc.tokenize(id_token.as_str());
+                let identifier = fe.tokenize(id_token.as_str());
 
                 let expr_token = pair_iter
                     .next()
                     .expect("Map pair must contain an expression");
-                let expr = plan_expr(pc, expr_token)?;
+                let expr = plan_expr(fe, expr_token)?;
                 out.push(MapEntryExpr {
                     key: identifier,
                     val: expr,
@@ -882,17 +866,13 @@ mod tests {
     fn plan(q: &str) -> Result<PlanArtifacts> {
         let backend = TestBackend::new();
 
-        let frontend = Frontend {
-            tokens: backend.tokens(),
-            backend_desc: backend.describe()?,
-        };
-        let mut pc = PlanningContext {
+        let mut pc = Frontend {
             slots: Default::default(),
             anon_rel_seq: 0,
             anon_node_seq: 0,
             backend: &backend,
         };
-        let plan = frontend.plan_in_context(q, &mut pc);
+        let plan = pc.plan_in_context(q);
 
         match plan {
             Ok(plan) => Ok(PlanArtifacts {

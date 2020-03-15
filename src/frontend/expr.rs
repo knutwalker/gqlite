@@ -2,7 +2,7 @@
 // to expressions.
 
 use crate::backend::{Backend, Token};
-use crate::frontend::{PlanningContext, Result, Rule};
+use crate::frontend::{Frontend, Result, Rule};
 use crate::Slot;
 use pest::iterators::Pair;
 use std::collections::HashSet;
@@ -93,17 +93,14 @@ pub struct MapEntryExpr {
     pub val: Expr,
 }
 
-pub(super) fn plan_expr<T: Backend>(
-    pc: &mut PlanningContext<T>,
-    expression: Pair<Rule>,
-) -> Result<Expr> {
+pub(super) fn plan_expr<T: Backend>(fe: &mut Frontend<T>, expression: Pair<Rule>) -> Result<Expr> {
     let mut or_expressions = Vec::new();
     for inner in expression.into_inner() {
         match inner.as_rule() {
             Rule::and_expr => {
                 let mut and_expressions: Vec<Expr> = Vec::new();
                 for term in inner.into_inner() {
-                    and_expressions.push(plan_term(pc, term)?)
+                    and_expressions.push(plan_term(fe, term)?)
                 }
                 let and_expr = if and_expressions.len() == 1 {
                     and_expressions.remove(0)
@@ -122,7 +119,7 @@ pub(super) fn plan_expr<T: Backend>(
     }
 }
 
-fn plan_term<T: Backend>(pc: &mut PlanningContext<T>, term: Pair<Rule>) -> Result<Expr> {
+fn plan_term<T: Backend>(fe: &mut Frontend<T>, term: Pair<Rule>) -> Result<Expr> {
     match term.as_rule() {
         Rule::string => {
             let content = term
@@ -133,24 +130,24 @@ fn plan_term<T: Backend>(pc: &mut PlanningContext<T>, term: Pair<Rule>) -> Resul
             return Ok(Expr::String(String::from(content)));
         }
         Rule::id => {
-            let tok = pc.tokenize(term.as_str());
-            return Ok(Expr::Slot(pc.get_or_alloc_slot(tok)));
+            let tok = fe.tokenize(term.as_str());
+            return Ok(Expr::Slot(fe.get_or_alloc_slot(tok)));
         }
         Rule::prop_lookup => {
             let mut prop_lookup = term.into_inner();
             let prop_lookup_expr = prop_lookup.next().unwrap();
             let base = match prop_lookup_expr.as_rule() {
                 Rule::id => {
-                    let tok = pc.tokenize(prop_lookup_expr.as_str());
-                    Expr::Slot(pc.get_or_alloc_slot(tok))
+                    let tok = fe.tokenize(prop_lookup_expr.as_str());
+                    Expr::Slot(fe.get_or_alloc_slot(tok))
                 }
                 _ => unreachable!(),
             };
             let mut props = Vec::new();
             for p_inner in prop_lookup {
                 if let Rule::id = p_inner.as_rule() {
-                    props.push(pc.tokenize(p_inner.as_str()));
-                }
+                    props.push(fe.tokenize(p_inner.as_str()));
+                }   
             }
             return Ok(Expr::Prop(Box::new(base), props));
         }
@@ -159,11 +156,11 @@ fn plan_term<T: Backend>(pc: &mut PlanningContext<T>, term: Pair<Rule>) -> Resul
             let func_name_item = func_call
                 .next()
                 .expect("All func_calls must start with an identifier");
-            let name = pc.tokenize(func_name_item.as_str());
+            let name = fe.tokenize(func_name_item.as_str());
             // Parse args
             let mut args = Vec::new();
             for arg in func_call {
-                args.push(plan_expr(pc, arg)?);
+                args.push(plan_expr(fe, arg)?);
             }
             return Ok(Expr::FuncCall { name, args });
         }
@@ -171,7 +168,7 @@ fn plan_term<T: Backend>(pc: &mut PlanningContext<T>, term: Pair<Rule>) -> Resul
             let mut items = Vec::new();
             let exprs = term.into_inner();
             for exp in exprs {
-                items.push(plan_expr(pc, exp)?);
+                items.push(plan_expr(fe, exp)?);
             }
             return Ok(Expr::List(items));
         }
@@ -195,8 +192,8 @@ fn plan_term<T: Backend>(pc: &mut PlanningContext<T>, term: Pair<Rule>) -> Resul
                 .next()
                 .expect("binary operators must have a right arg");
 
-            let left_expr = plan_term(pc, left)?;
-            let right_expr = plan_term(pc, right)?;
+            let left_expr = plan_term(fe, left)?;
+            let right_expr = plan_term(fe, right)?;
             return Ok(Expr::BinaryOp {
                 left: Box::new(left_expr),
                 right: Box::new(right_expr),
@@ -205,7 +202,7 @@ fn plan_term<T: Backend>(pc: &mut PlanningContext<T>, term: Pair<Rule>) -> Resul
         }
         Rule::expr => {
             // this happens when there are parenthetises forcing "full" expressions down here
-            return plan_expr(pc, term);
+            return plan_expr(fe, term);
         }
         _ => panic!("({:?}): {}", term.as_rule(), term.as_str()),
     }
@@ -233,18 +230,13 @@ mod tests {
     fn plan(q: &str) -> Result<PlanArtifacts> {
         let backend = TestBackend::new();
 
-        let frontend = Frontend {
-            tokens: backend.tokens(),
-            backend_desc: backend.describe()?,
-        };
-        let mut pc = PlanningContext {
+        let mut pc = Frontend {
             slots: Default::default(),
             anon_rel_seq: 0,
             anon_node_seq: 0,
             backend: &backend,
         };
-
-        let plan = frontend.plan_in_context(&format!("RETURN {}", q), &mut pc);
+        let plan = pc.plan_in_context(&format!("RETURN {}", q));
 
         if let Ok(LogicalPlan::Return {
             src: _,
