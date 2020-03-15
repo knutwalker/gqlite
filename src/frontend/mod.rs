@@ -242,7 +242,7 @@ fn plan_create(
 
     let mut nodes = Vec::new();
     let mut rels = Vec::new();
-    for (_, node) in pg.e {
+    for (_, node) in pg.v {
         if pc.is_bound(node.identifier) {
             // We already know about this node, it isn't meant to be created. ie
             // MATCH (n) CREATE (n)-[:NEWREL]->(newnode)
@@ -255,7 +255,7 @@ fn plan_create(
         });
     }
 
-    for rel in pg.v {
+    for rel in pg.e {
         match rel.dir {
             Some(Dir::Out) => {
                 rels.push(RelSpec {
@@ -445,9 +445,9 @@ pub struct PatternRel {
 
 #[derive(Debug, Default)]
 pub struct PatternGraph {
-    e: HashMap<Token, PatternNode>,
-    e_order: Vec<Token>,
-    v: Vec<PatternRel>,
+    v: HashMap<Token, PatternNode>,
+    v_order: Vec<Token>,
+    e: Vec<PatternRel>,
 
     // The following expression must be true for the pattern to match; this can be a
     // deeply nested combination of Expr::And / Expr::Or. The pattern parser does not guarantee
@@ -477,20 +477,20 @@ pub struct PatternGraph {
 
 impl PatternGraph {
     fn merge_node(&mut self, n: PatternNode) {
-        let entry = self.e.entry(n.identifier);
+        let entry = self.v.entry(n.identifier);
         match entry {
             Entry::Occupied(mut on) => {
                 on.get_mut().merge(&n);
             }
             Entry::Vacant(entry) => {
-                self.e_order.push(*entry.key());
+                self.v_order.push(*entry.key());
                 entry.insert(n);
             }
         };
     }
 
     fn merge_rel(&mut self, r: PatternRel) {
-        self.v.push(r)
+        self.e.push(r)
     }
 }
 
@@ -527,8 +527,8 @@ fn plan_match(
     // Start by picking one high-selectivity node
     let mut candidate_id = None;
     let mut solved_for_labelled_node = false;
-    for id in &pg.e_order {
-        let mut candidate = pg.e.get_mut(id).unwrap();
+    for id in &pg.v_order {
+        let mut candidate = pg.v.get_mut(id).unwrap();
         // Advanced algorithm: Pick first node with a label filter on it and call it an afternoon
         if !candidate.labels.is_empty() {
             if candidate.labels.len() > 1 {
@@ -548,7 +548,7 @@ fn plan_match(
     }
     if !solved_for_labelled_node {
         if let Some(candidate_id) = candidate_id {
-            let mut candidate = pg.e.get_mut(candidate_id).unwrap();
+            let mut candidate = pg.v.get_mut(candidate_id).unwrap();
             if candidate.labels.len() > 1 {
                 panic!("Multiple label match not yet implemented")
             }
@@ -569,7 +569,7 @@ fn plan_match(
         let mut found_unsolved = false;
         let mut solved_any = false;
         // Look for relationships we can expand
-        for mut rel in &mut pg.v {
+        for mut rel in &mut pg.e {
             if rel.solved {
                 continue;
             }
@@ -577,12 +577,12 @@ fn plan_match(
 
             let right_id = rel.right_node.unwrap();
             let left_id = rel.left_node;
-            let left_solved = pg.e.get(&left_id).unwrap().solved;
-            let right_solved = pg.e.get_mut(&right_id).unwrap().solved;
+            let left_solved = pg.v.get(&left_id).unwrap().solved;
+            let right_solved = pg.v.get_mut(&right_id).unwrap().solved;
 
             if left_solved && !right_solved {
                 // Left is solved and right isn't, so we can expand to the right
-                let mut right_node = pg.e.get_mut(&right_id).unwrap();
+                let mut right_node = pg.v.get_mut(&right_id).unwrap();
                 right_node.solved = true;
                 rel.solved = true;
                 solved_any = true;
@@ -598,7 +598,7 @@ fn plan_match(
                 plan = filter_expand(expand, dst, &right_node.labels);
             } else if !left_solved && right_solved {
                 // Right is solved and left isn't, so we can expand to the left
-                let mut left_node = pg.e.get_mut(&left_id).unwrap();
+                let mut left_node = pg.v.get_mut(&left_id).unwrap();
                 left_node.solved = true;
                 rel.solved = true;
                 solved_any = true;
