@@ -7,7 +7,7 @@
 
 use crate::backend::gram::functions::AggregatingFuncSpec;
 use crate::backend::{Backend, BackendCursor, BackendDesc, Token, Tokens};
-use crate::frontend::{Dir, LogicalPlan};
+use crate::frontend::{Dir, FrontendPlan, LogicalPlan};
 use crate::{frontend, Error, Row, Slot, Val};
 use anyhow::Result;
 use rand::Rng;
@@ -216,8 +216,12 @@ impl Backend for GramBackend {
         Rc::clone(&self.tokens)
     }
 
-    fn eval(&mut self, plan: LogicalPlan, cursor: &mut GramCursor) -> Result<(), Error> {
-        let slots = match &plan {
+    fn eval(&mut self, plan: FrontendPlan, cursor: &mut GramCursor) -> Result<()> {
+        cursor
+            .row
+            .slots
+            .resize(plan.slots_to_token.len(), GramVal::Lit(Val::Null));
+        let slots = match &plan.plan {
             LogicalPlan::Return { projections, .. } => {
                 projections.iter().map(|p| (p.alias, p.dst)).collect()
             }
@@ -227,7 +231,7 @@ impl Backend for GramBackend {
             cursor.projection.slots.resize(slots.len(), Val::Null);
         }
 
-        let plan = self.convert(plan)?;
+        let plan = self.convert(plan.plan)?;
         cursor.ctx = Context {
             tokens: Rc::clone(&self.tokens),
             g: Rc::clone(&self.g),
@@ -235,11 +239,6 @@ impl Backend for GramBackend {
         };
         cursor.slots = slots;
         cursor.plan = Some(plan);
-
-        if cursor.row.slots.len() < 16 {
-            // TODO derive this from the logical plan
-            cursor.row.slots.resize(16, GramVal::Lit(Val::Null));
-        }
         Ok(())
     }
 

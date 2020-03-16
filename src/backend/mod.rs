@@ -2,7 +2,7 @@
 // Backends implement the actual storage of graphs, and provide implementations of the
 // logical operators the frontend emits that can act on that storage.
 //
-use crate::frontend::LogicalPlan;
+use crate::frontend::{Dir, FrontendPlan};
 use crate::{Error, Row, Type};
 use anyhow::Result;
 use std::cell::RefCell;
@@ -21,14 +21,40 @@ pub trait Backend: Debug {
 
     fn new_cursor(&mut self) -> Self::Cursor;
 
+    fn unknown_cost() -> u64 {
+        u64::max_value()
+    }
+
     fn tokens(&self) -> Rc<RefCell<Tokens>>;
 
     fn tokenize(&self, contents: &str) -> Token {
         self.tokens().borrow_mut().tokenize(contents)
     }
 
+    #[allow(unused_variables)]
+    fn estimate_expand_cost(
+        &self,
+        label: Option<Token>,
+        rel_type: Option<Token>,
+        dir: Option<Dir>,
+    ) -> u64 {
+        if label.is_some() {
+            1
+        } else {
+            Self::unknown_cost()
+        }
+    }
+
+    fn estimate_match_cost(&self, label: Option<Token>) -> u64 {
+        if label.is_some() {
+            1
+        } else {
+            Self::unknown_cost()
+        }
+    }
+
     // Evaluate a logical plan and run it on the cursor
-    fn eval(&mut self, plan: LogicalPlan, cursor: &mut Self::Cursor) -> Result<()>;
+    fn eval(&mut self, plan: FrontendPlan, cursor: &mut Self::Cursor) -> Result<()>;
 
     // Describe this backend for the frontends benefit; intention is that this will
     // eventually contain things like listings of indexes etc. Once it does, it'll also need to

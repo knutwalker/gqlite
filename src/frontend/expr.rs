@@ -147,7 +147,7 @@ fn plan_term<T: Backend>(fe: &mut Frontend<T>, term: Pair<Rule>) -> Result<Expr>
             for p_inner in prop_lookup {
                 if let Rule::id = p_inner.as_rule() {
                     props.push(fe.tokenize(p_inner.as_str()));
-                }   
+                }
             }
             return Ok(Expr::Prop(Box::new(base), props));
         }

@@ -34,14 +34,25 @@ pub struct Frontend<'a, T> {
 }
 
 impl<'a, T: Backend> Frontend<'a, T> {
-    pub fn plan(backend: &'a T, query_str: &str) -> Result<LogicalPlan> {
+    pub fn plan(backend: &'a T, query_str: &str) -> Result<FrontendPlan> {
         let mut frontend = Frontend {
             slots: Default::default(),
             anon_rel_seq: 0,
             anon_node_seq: 0,
             backend,
         };
-        frontend.plan_in_context(query_str)
+        let plan = frontend.plan_in_context(query_str)?;
+        let mut slots_to_token = Vec::with_capacity(frontend.slots.len());
+        for (token, slot) in frontend.slots {
+            if slot >= slots_to_token.len() {
+                slots_to_token.resize(slot + 1, Token::max_value());
+            }
+            slots_to_token[slot] = token;
+        }
+        Ok(FrontendPlan {
+            plan,
+            slots_to_token,
+        })
     }
 
     pub fn plan_in_context(&mut self, query_str: &str) -> Result<LogicalPlan> {
@@ -108,6 +119,12 @@ impl<'a, T: Backend> Frontend<'a, T> {
         self.anon_node_seq += 1;
         self.tokenize(&format!("AnonNode#{}", seq))
     }
+}
+
+#[derive(Debug)]
+pub struct FrontendPlan {
+    pub plan: LogicalPlan,
+    pub slots_to_token: Vec<Token>,
 }
 
 // The ultimate output of the frontend is a logical plan. The logical plan is a tree of operators.
@@ -421,6 +438,17 @@ pub struct PatternRel {
     solved: bool,
 }
 
+#[derive(Debug)]
+struct PossibleExpand {
+    label: Option<Token>,
+    rel_type: Option<Token>,
+    dir: Option<Dir>,
+    cost: u64,
+    node_index: usize,
+    rel_index: usize,
+    other_node_index: usize,
+}
+
 #[derive(Debug, Default)]
 pub struct PatternGraph {
     v: HashMap<Token, PatternNode>,
@@ -474,71 +502,157 @@ impl PatternGraph {
 
 fn plan_match<T: Backend>(
     fe: &mut Frontend<T>,
-    src: LogicalPlan,
+    plan: LogicalPlan,
     match_stmt: Pair<Rule>,
 ) -> Result<LogicalPlan> {
-    fn filter_expand(expand: LogicalPlan, slot: Token, labels: &[Token]) -> LogicalPlan {
-        let labels = labels
-            .iter()
-            .map(|&label| Expr::HasLabel(slot, label))
-            .collect::<Vec<_>>();
-        if labels.is_empty() {
-            expand
-        } else if labels.len() == 1 {
-            LogicalPlan::Selection {
-                src: Box::new(expand),
-                predicate: labels.into_iter().next().unwrap(),
-            }
-        } else {
-            LogicalPlan::Selection {
-                src: Box::new(expand),
-                predicate: Expr::And(labels),
-            }
-        }
-    }
-
-    let mut plan = src;
-    let mut pg = parse_pattern_graph(fe, match_stmt)?;
-
-    // Ok, now we have parsed the pattern into a full graph, time to start solving it
+    let pg = parse_pattern_graph(fe, match_stmt)?;
     log::debug!("built pg: {:?}", pg);
-    // Start by picking one high-selectivity node
-    let mut candidate_id = None;
-    let mut solved_for_labelled_node = false;
-    for id in &pg.v_order {
-        let mut candidate = pg.v.get_mut(id).unwrap();
-        // Advanced algorithm: Pick first node with a label filter on it and call it an afternoon
-        if !candidate.labels.is_empty() {
-            if candidate.labels.len() > 1 {
-                panic!("Multiple label match not yet implemented")
-            }
-            plan = LogicalPlan::NodeScan {
-                src: Box::new(plan),
-                slot: fe.get_or_alloc_slot(*id),
-                labels: candidate.labels.first().cloned(),
-            };
-            candidate.solved = true;
-            solved_for_labelled_node = true;
-            break;
-        } else if candidate_id.is_none() {
-            candidate_id = Some(id);
-        }
+    // Ok, now we have parsed the pattern into a full graph, time to start solving it
+    // If we have relationships, we go by the expand with the smallest cost
+    if !pg.e.is_empty() {
+        return plan_match_with_rels(fe, plan, pg);
     }
-    if !solved_for_labelled_node {
-        if let Some(candidate_id) = candidate_id {
-            let mut candidate = pg.v.get_mut(candidate_id).unwrap();
-            if candidate.labels.len() > 1 {
-                panic!("Multiple label match not yet implemented")
-            }
-            plan = LogicalPlan::NodeScan {
-                src: Box::new(plan),
-                slot: fe.get_or_alloc_slot(*candidate_id),
-                labels: candidate.labels.first().cloned(),
-            };
-            candidate.solved = true;
-        }
+    // If the match is empty, we do nothing
+    if pg.v.is_empty() {
+        return Ok(plan_match_predicate(plan, pg));
     }
 
+    // We sort all nodes by their estimated cost
+    // We also split multiple labels into multiple runs over the same node, each with a single label
+    //  so that we can start with the cheapest match as the scan and do a filter select for
+    //  all following labels
+    let mut nodes: Vec<(u64, Token, Option<Token>)> = pg
+        .v_order
+        .iter()
+        .flat_map(|node_index| {
+            let p: &PatternNode = pg.v.get(node_index).unwrap();
+            if p.labels.is_empty() {
+                let cost = fe.backend.estimate_match_cost(None);
+                vec![(cost, *node_index, None)]
+            } else {
+                p.labels
+                    .iter()
+                    .map(|&l| {
+                        let cost = fe.backend.estimate_match_cost(Some(l));
+                        (cost, *node_index, Some(l))
+                    })
+                    .collect::<Vec<_>>()
+            }
+        })
+        .collect::<Vec<_>>();
+
+    nodes.sort_by_key(|(cost, _, _)| *cost);
+
+    let mut nodes = nodes.into_iter();
+    let (_, node_id, node_label) = nodes.next().unwrap();
+    let plan = LogicalPlan::NodeScan {
+        src: Box::new(plan),
+        slot: fe.get_or_alloc_slot(node_id),
+        labels: node_label,
+    };
+
+    let plan = nodes.try_fold(plan, |src, (_, node_id, node_label)| {
+        let label = node_label?;
+        Some(LogicalPlan::Selection {
+            src: Box::new(src),
+            predicate: Expr::HasLabel(fe.get_or_alloc_slot(node_id), label),
+        })
+    });
+
+    let plan = plan.ok_or_else(|| anyhow!("Cannot solve pattern with multiple matches: {:?}", pg))?;
+    Ok(plan_match_predicate(plan, pg))
+}
+
+fn plan_match_with_rels<T: Backend>(
+    fe: &mut Frontend<T>,
+    plan: LogicalPlan,
+    mut pg: PatternGraph,
+) -> Result<LogicalPlan> {
+    // We create pairs of "half expands" and ask the backend to estimate the cost for expanding those.
+    // We then take the smallest one (i.e. has the lowest cost) and start our solve with that one
+    let lowest_cost_expand =
+        pg.e.iter()
+            .enumerate()
+            .flat_map(|(rel_index, p)| {
+                let rel_type = match p.rel_type {
+                    RelType::Anon(_) => None,
+                    RelType::Defined(tpe) => Some(tpe),
+                };
+                let label =
+                    pg.v.get(&p.left_node)
+                        .and_then(|n| n.labels.first())
+                        .copied();
+                let dir = p.dir;
+                let cost = fe.backend.estimate_expand_cost(label, rel_type, dir);
+                let left = PossibleExpand {
+                    label,
+                    rel_type,
+                    rel_index,
+                    dir,
+                    cost,
+                    node_index: p.left_node,
+                    other_node_index: p.right_node.unwrap(),
+                };
+                let label =
+                    pg.v.get(&p.right_node.unwrap())
+                        .and_then(|n| n.labels.first())
+                        .copied();
+                let dir = dir.map(|d| d.reverse());
+                let cost = fe.backend.estimate_expand_cost(label, rel_type, dir);
+                let right = PossibleExpand {
+                    label,
+                    rel_type,
+                    rel_index,
+                    dir,
+                    cost,
+                    node_index: p.right_node.unwrap(),
+                    other_node_index: p.left_node,
+                };
+                vec![left, right]
+            })
+            .min_by_key(|p| p.cost)
+            // We know that the unwrap is safe, as we have at least one edge
+            .unwrap();
+
+    let lowest_cost_expand: PossibleExpand = lowest_cost_expand;
+
+    // start solving with the node scan from the lowest cost expand
+    let node_index = lowest_cost_expand.node_index;
+    let node = pg.v.get_mut(&node_index).unwrap();
+    node.solved = true;
+    let src = fe.get_or_alloc_slot(node_index);
+    let node_scan = LogicalPlan::NodeScan {
+        src: Box::new(plan),
+        slot: src,
+        labels: node.labels.first().copied(),
+    };
+
+    // finish the expand to the other node of that particular half
+    let rel: &mut PatternRel = pg.e.get_mut(lowest_cost_expand.rel_index).unwrap();
+    rel.solved = true;
+    let other_node_index = lowest_cost_expand.other_node_index;
+    let other_node = pg.v.get_mut(&other_node_index).unwrap();
+    other_node.solved = true;
+    let dst = fe.get_or_alloc_slot(other_node_index);
+
+    let expand = LogicalPlan::Expand {
+        src: Box::new(node_scan),
+        src_slot: src,
+        rel_slot: fe.get_or_alloc_slot(rel.identifier),
+        dst_slot: dst,
+        rel_type: rel.rel_type,
+        dir: lowest_cost_expand.dir,
+    };
+    let plan = filter_expand(expand, dst, &other_node.labels);
+
+    plan_match_remaining_rels(fe, plan, pg)
+}
+
+fn plan_match_remaining_rels<T: Backend>(
+    fe: &mut Frontend<T>,
+    mut plan: LogicalPlan,
+    mut pg: PatternGraph,
+) -> Result<LogicalPlan> {
     // Now we iterate until the whole pattern is solved. The way this works is that "solving"
     // a part of the pattern expands the plan such that when the top-level part of the plan is
     // executed, all the solved identifiers will be present in the output row. That then unlocks
@@ -600,20 +714,47 @@ fn plan_match<T: Backend>(
         // Eg. we currently don't handle circular patterns (requiring JOINs) or patterns
         // with multiple disjoint subgraphs.
         if !solved_any {
-            panic!("Failed to solve pattern: {:?}", pg)
+            bail!("Failed to solve pattern: {:?}", pg)
         }
     }
 
+    Ok(plan_match_predicate(plan, pg))
+}
+
+fn plan_match_predicate(
+    plan: LogicalPlan,
+    pg: PatternGraph,
+) -> LogicalPlan {
     // Finally, add the pattern-wide predicate to filter the result of the pattern match
     // see the note on PatternGraph about issues with this "late filter" approach
     if let Some(pred) = pg.predicate {
-        return Ok(LogicalPlan::Selection {
+        return LogicalPlan::Selection {
             src: Box::new(plan),
             predicate: pred,
-        });
+        };
     }
 
-    Ok(plan)
+    plan
+}
+
+fn filter_expand(expand: LogicalPlan, slot: Token, labels: &[Token]) -> LogicalPlan {
+    if labels.is_empty() {
+        expand
+    } else if labels.len() == 1 {
+        LogicalPlan::Selection {
+            src: Box::new(expand),
+            predicate: Expr::HasLabel(slot, labels[0]),
+        }
+    } else {
+        let labels = labels
+            .iter()
+            .map(|label| Expr::HasLabel(slot, *label))
+            .collect();
+        LogicalPlan::Selection {
+            src: Box::new(expand),
+            predicate: Expr::And(labels),
+        }
+    }
 }
 
 fn parse_pattern_graph<T: Backend>(
@@ -819,7 +960,7 @@ mod test_backend {
             Rc::clone(&self.tokens)
         }
 
-        fn eval(&mut self, _plan: LogicalPlan, _cursor: &mut Self::Cursor) -> Result<()> {
+        fn eval(&mut self, _plan: FrontendPlan, _cursor: &mut Self::Cursor) -> Result<()> {
             Ok(())
         }
 
