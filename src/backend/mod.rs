@@ -5,10 +5,8 @@
 use crate::frontend::{Dir, FrontendPlan};
 use crate::{Error, Row, Type};
 use anyhow::Result;
-use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
 use std::fmt::Debug;
-use std::rc::Rc;
 
 // I don't know if any of this makes any sense, but the thoughts here is like.. lets make it
 // easy to build experimental backends, that can convert a logical plan tree into something that
@@ -25,11 +23,7 @@ pub trait Backend: Debug {
         u64::max_value()
     }
 
-    fn tokens(&self) -> Rc<RefCell<Tokens>>;
-
-    fn tokenize(&self, contents: &str) -> Token {
-        self.tokens().borrow_mut().tokenize(contents)
-    }
+    fn tokenize(&mut self, contents: &str) -> Token;
 
     #[allow(unused_variables)]
     fn estimate_expand_cost(
@@ -159,10 +153,6 @@ pub struct Tokens {
 }
 
 impl Tokens {
-    pub fn new() -> Tokens {
-        Tokens::default()
-    }
-
     pub fn lookup(&self, tok: usize) -> Option<&str> {
         for (content, candidate) in self.table.iter() {
             if *candidate == tok {

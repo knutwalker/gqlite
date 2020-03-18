@@ -27,14 +27,14 @@ pub struct Frontend<'a, T> {
     // Mapping of names used in the query string to slots in the row being processed
     slots: HashMap<Token, usize>,
 
-    backend: &'a T,
+    backend: &'a mut T,
 
     anon_rel_seq: u32,
     anon_node_seq: u32,
 }
 
 impl<'a, T: Backend> Frontend<'a, T> {
-    pub fn plan(backend: &'a T, query_str: &str) -> Result<FrontendPlan> {
+    pub fn plan(backend: &'a mut T, query_str: &str) -> Result<FrontendPlan> {
         let mut frontend = Frontend {
             slots: Default::default(),
             anon_rel_seq: 0,
@@ -937,7 +937,7 @@ mod test_backend {
 
     impl TestBackend {
         pub(crate) fn new() -> Self {
-            let mut tokens = Tokens::new();
+            let mut tokens = Tokens::default();
             let tok_expr = tokens.tokenize("expr");
             let fn_count = tokens.tokenize("count");
             let tokens = Rc::new(RefCell::new(tokens));
@@ -956,8 +956,8 @@ mod test_backend {
             ()
         }
 
-        fn tokens(&self) -> Rc<RefCell<Tokens>> {
-            Rc::clone(&self.tokens)
+        fn tokenize(&mut self, contents: &str) -> usize {
+            self.tokens.borrow_mut().tokenize(contents)
         }
 
         fn eval(&mut self, _plan: FrontendPlan, _cursor: &mut Self::Cursor) -> Result<()> {
@@ -980,18 +980,16 @@ mod test_backend {
 mod tests {
     use super::*;
     use super::test_backend::*;
-    use crate::backend::{Token, Tokens};
+    use crate::backend::Token;
     use anyhow::Result;
-    use std::cell::RefCell;
     use std::collections::HashMap;
-    use std::rc::Rc;
 
     // Outcome of testing planning; the plan plus other related items to do checks on
     #[derive(Debug)]
     struct PlanArtifacts {
         plan: LogicalPlan,
         slots: HashMap<Token, usize>,
-        tokens: Rc<RefCell<Tokens>>,
+        backend: TestBackend,
     }
 
     impl PlanArtifacts {
@@ -1000,26 +998,27 @@ mod tests {
         }
 
         fn tokenize(&mut self, content: &str) -> Token {
-            self.tokens.borrow_mut().tokenize(content)
+            self.backend.tokenize(content)
         }
     }
 
     fn plan(q: &str) -> Result<PlanArtifacts> {
-        let backend = TestBackend::new();
+        let mut backend = TestBackend::new();
 
         let mut pc = Frontend {
             slots: Default::default(),
             anon_rel_seq: 0,
             anon_node_seq: 0,
-            backend: &backend,
+            backend: &mut backend,
         };
         let plan = pc.plan_in_context(q);
+        let slots = pc.slots;
 
         match plan {
             Ok(plan) => Ok(PlanArtifacts {
                 plan,
-                slots: pc.slots,
-                tokens: backend.tokens(),
+                backend,
+                slots,
             }),
             Err(e) => {
                 println!("{}", e);

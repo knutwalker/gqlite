@@ -212,31 +212,30 @@ fn plan_term<T: Backend>(fe: &mut Frontend<T>, term: Pair<Rule>) -> Result<Expr>
 mod tests {
     use super::*;
     use super::super::test_backend::*;
-    use crate::backend::{Token, Tokens};
+    use crate::backend::Token;
     use crate::frontend::{Frontend, LogicalPlan};
     use anyhow::Result;
-    use std::cell::RefCell;
     use std::collections::HashMap;
-    use std::rc::Rc;
 
     // Outcome of testing planning; the plan plus other related items to do checks on
     #[derive(Debug)]
     struct PlanArtifacts {
         expr: Expr,
         slots: HashMap<Token, usize>,
-        tokens: Rc<RefCell<Tokens>>,
+        backend: TestBackend,
     }
 
     fn plan(q: &str) -> Result<PlanArtifacts> {
-        let backend = TestBackend::new();
+        let mut backend = TestBackend::new();
 
         let mut pc = Frontend {
             slots: Default::default(),
             anon_rel_seq: 0,
             anon_node_seq: 0,
-            backend: &backend,
+            backend: &mut backend,
         };
         let plan = pc.plan_in_context(&format!("RETURN {}", q));
+        let slots = pc.slots;
 
         if let Ok(LogicalPlan::Return {
             src: _,
@@ -244,9 +243,9 @@ mod tests {
         }) = plan
         {
             return Ok(PlanArtifacts {
+                backend,
                 expr: projections[0].expr.clone(),
-                slots: pc.slots,
-                tokens: backend.tokens(),
+                slots,
             });
         } else {
             return Err(anyhow!("Expected RETURN plan, got: {:?}", plan?));

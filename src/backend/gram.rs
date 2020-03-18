@@ -32,9 +32,7 @@ pub struct GramBackend {
 
 impl GramBackend {
     pub fn open(mut file: File) -> Result<GramBackend> {
-        let mut tokens = Tokens {
-            table: Default::default(),
-        };
+        let mut tokens = Tokens::default();
         let g = parser::load(&mut tokens, &mut file)?;
 
         let mut aggregators = HashMap::new();
@@ -212,8 +210,8 @@ impl Backend for GramBackend {
         }
     }
 
-    fn tokens(&self) -> Rc<RefCell<Tokens>> {
-        Rc::clone(&self.tokens)
+    fn tokenize(&mut self, contents: &str) -> usize {
+        self.tokens.borrow_mut().tokenize(contents)
     }
 
     fn eval(&mut self, plan: FrontendPlan, cursor: &mut GramCursor) -> Result<()> {
@@ -754,9 +752,9 @@ impl Operator for Unwind {
 }
 
 mod parser {
-    use super::Val;
-    use crate::backend::gram::{Graph, Node};
-    use crate::backend::{Token, Tokens};
+    use super::Val;    
+    use crate::backend::gram::{Graph, Node, Tokens};
+    use crate::backend::Token;
     use crate::pest::Parser;
     use anyhow::Result;
     use std::collections::HashMap;
@@ -1047,8 +1045,8 @@ fn append_node(
 }
 
 mod functions {
-    use super::{Context, Expr, GramRow, GramVal, Val};
-    use crate::backend::{FuncSignature, FuncType, Tokens};
+    use super::{Context, Expr, GramRow, GramVal, Tokens, Val};
+    use crate::backend::{FuncSignature, FuncType};
     use crate::{Result, Type};
     use std::cmp::Ordering;
     use std::fmt::Debug;
