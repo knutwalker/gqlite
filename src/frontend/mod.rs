@@ -5,7 +5,7 @@
 
 use pest::Parser;
 
-use crate::backend::{Backend, BackendDesc, Token};
+use crate::backend::{Backend, BackendDesc, EstimatedCost, Token};
 use crate::Slot;
 use anyhow::Result;
 use pest::iterators::Pair;
@@ -443,7 +443,7 @@ struct PossibleExpand {
     label: Option<Token>,
     rel_type: Option<Token>,
     dir: Option<Dir>,
-    cost: u64,
+    cost: EstimatedCost,
     node_index: usize,
     rel_index: usize,
     other_node_index: usize,
@@ -521,19 +521,19 @@ fn plan_match<T: Backend>(
     // We also split multiple labels into multiple runs over the same node, each with a single label
     //  so that we can start with the cheapest match as the scan and do a filter select for
     //  all following labels
-    let mut nodes: Vec<(u64, Token, Option<Token>)> = pg
+    let mut nodes: Vec<(EstimatedCost, Token, Option<Token>)> = pg
         .v_order
         .iter()
         .flat_map(|node_index| {
             let p: &PatternNode = pg.v.get(node_index).unwrap();
             if p.labels.is_empty() {
-                let cost = fe.backend.estimate_match_cost(None);
+                let cost = fe.backend.estimate_scan(None);
                 vec![(cost, *node_index, None)]
             } else {
                 p.labels
                     .iter()
                     .map(|&l| {
-                        let cost = fe.backend.estimate_match_cost(Some(l));
+                        let cost = fe.backend.estimate_scan(Some(l));
                         (cost, *node_index, Some(l))
                     })
                     .collect::<Vec<_>>()
@@ -584,7 +584,7 @@ fn plan_match_with_rels<T: Backend>(
                         .and_then(|n| n.labels.first())
                         .copied();
                 let dir = p.dir;
-                let cost = fe.backend.estimate_expand_cost(label, rel_type, dir);
+                let cost = fe.backend.estimate_expand(label, rel_type, dir);
                 let left = PossibleExpand {
                     label,
                     rel_type,
@@ -599,7 +599,7 @@ fn plan_match_with_rels<T: Backend>(
                         .and_then(|n| n.labels.first())
                         .copied();
                 let dir = dir.map(|d| d.reverse());
-                let cost = fe.backend.estimate_expand_cost(label, rel_type, dir);
+                let cost = fe.backend.estimate_expand(label, rel_type, dir);
                 let right = PossibleExpand {
                     label,
                     rel_type,
@@ -913,7 +913,7 @@ fn parse_map_expression<T: Backend>(
 #[cfg(test)]
 mod test_backend {
     use super::*;
-    use crate::backend::{BackendCursor, BackendDesc, FuncSignature, FuncType, Token, Tokens};
+    use crate::backend::{BackendCursor, BackendDesc, CostEstimation, FuncSignature, FuncType, Token, Tokens};
     use crate::{Row, Type};
     use anyhow::Result;
     use std::cell::RefCell;
@@ -971,6 +971,8 @@ mod test_backend {
             Ok(backend_desc)
         }
     }
+
+    impl CostEstimation for TestBackend {}
 }
 
 #[cfg(test)]

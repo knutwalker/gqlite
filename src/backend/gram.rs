@@ -6,7 +6,7 @@
 // It is currently single threaded, and provides no data durability guarantees.
 
 use crate::backend::gram::functions::AggregatingFuncSpec;
-use crate::backend::{Backend, BackendCursor, BackendDesc, Token, Tokens};
+use crate::backend::{Backend, BackendCursor, BackendDesc, CostEstimation, EstimatedCost, Token, Tokens};
 use crate::frontend::{Dir, FrontendPlan, LogicalPlan};
 use crate::{frontend, Error, Row, Slot, Val};
 use anyhow::Result;
@@ -247,6 +247,29 @@ impl Backend for GramBackend {
         }
 
         Ok(BackendDesc::new(functions))
+    }
+}
+
+impl CostEstimation for GramBackend {
+    fn estimate_expand(
+        &self,
+        label: Option<Token>,
+        _rel_type: Option<Token>,
+        _dir: Option<Dir>,
+    ) -> super::EstimatedCost {
+        if label.is_some() {
+            EstimatedCost::Expand { expand: 1, scan: 1 }
+        } else {
+            EstimatedCost::Unknown
+        }
+    }
+
+    fn estimate_scan(&self, label: Option<Token>) -> EstimatedCost {
+        if label.is_some() {
+            EstimatedCost::Scan(1)
+        } else {
+            EstimatedCost::Unknown
+        }
     }
 }
 

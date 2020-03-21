@@ -14,38 +14,12 @@ use std::fmt::Debug;
 // though I'm not sure it's possible to maintain that invariant.. It does simplify a lot of stuff
 // in the planning side and in the API to not have to deal with different backends having different
 // generics. Much of that difficulty is likely my poor Rust skills tho.
-pub trait Backend: Debug {
+pub trait Backend: Debug + CostEstimation {
     type Cursor: BackendCursor;
 
     fn new_cursor(&mut self) -> Self::Cursor;
 
-    fn unknown_cost() -> u64 {
-        u64::max_value()
-    }
-
     fn tokenize(&mut self, contents: &str) -> Token;
-
-    #[allow(unused_variables)]
-    fn estimate_expand_cost(
-        &self,
-        label: Option<Token>,
-        rel_type: Option<Token>,
-        dir: Option<Dir>,
-    ) -> u64 {
-        if label.is_some() {
-            1
-        } else {
-            Self::unknown_cost()
-        }
-    }
-
-    fn estimate_match_cost(&self, label: Option<Token>) -> u64 {
-        if label.is_some() {
-            1
-        } else {
-            Self::unknown_cost()
-        }
-    }
 
     // Evaluate a logical plan and run it on the cursor
     fn eval(&mut self, plan: FrontendPlan, cursor: &mut Self::Cursor) -> Result<()>;
@@ -55,6 +29,33 @@ pub trait Backend: Debug {
     // include a digest or a version that gets embedded with the planned query, because the query
     // plan may become invalid if indexes or constraints are added and removed.
     fn describe(&self) -> Result<BackendDesc, Error>;
+}
+
+#[derive(Debug, Copy, Clone, PartialEq, Eq, PartialOrd, Ord)]
+pub enum EstimatedCost {
+    Scan(u64),
+    Expand { expand: u64, scan: u64 },
+    Unknown,
+}
+
+/// Can estimate costs for certain operations like expand and node scan
+pub trait CostEstimation {
+    /// Estimate the cost for an expand operation
+    #[allow(unused_variables)]
+    fn estimate_expand(
+        &self,
+        label: Option<Token>,
+        rel_type: Option<Token>,
+        dir: Option<Dir>,
+    ) -> EstimatedCost {
+        EstimatedCost::Unknown
+    }
+
+    /// Estimate the cost for a scan operation
+    #[allow(unused_variables)]
+    fn estimate_scan(&self, label: Option<Token>) -> EstimatedCost {
+        EstimatedCost::Unknown
+    }
 }
 
 // To allow each backend to own how values are represented, and to let them optimize
