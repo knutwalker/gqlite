@@ -210,8 +210,8 @@ fn plan_term<T: Backend>(fe: &mut Frontend<T>, term: Pair<Rule>) -> Result<Expr>
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use super::super::test_backend::*;
+    use super::*;
     use crate::backend::Token;
     use crate::frontend::{Frontend, LogicalPlan};
     use anyhow::Result;

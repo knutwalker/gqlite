@@ -559,7 +559,8 @@ fn plan_match<T: Backend>(
         })
     });
 
-    let plan = plan.ok_or_else(|| anyhow!("Cannot solve pattern with multiple matches: {:?}", pg))?;
+    let plan =
+        plan.ok_or_else(|| anyhow!("Cannot solve pattern with multiple matches: {:?}", pg))?;
     Ok(plan_match_predicate(plan, pg))
 }
 
@@ -721,10 +722,7 @@ fn plan_match_remaining_rels<T: Backend>(
     Ok(plan_match_predicate(plan, pg))
 }
 
-fn plan_match_predicate(
-    plan: LogicalPlan,
-    pg: PatternGraph,
-) -> LogicalPlan {
+fn plan_match_predicate(plan: LogicalPlan, pg: PatternGraph) -> LogicalPlan {
     // Finally, add the pattern-wide predicate to filter the result of the pattern match
     // see the note on PatternGraph about issues with this "late filter" approach
     if let Some(pred) = pg.predicate {
@@ -927,7 +925,6 @@ mod test_backend {
         }
     }
 
-
     #[derive(Debug)]
     pub(crate) struct TestBackend {
         tokens: Rc<RefCell<Tokens>>,
@@ -978,8 +975,8 @@ mod test_backend {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use super::test_backend::*;
+    use super::*;
     use crate::backend::Token;
     use anyhow::Result;
     use std::collections::HashMap;
