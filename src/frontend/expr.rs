@@ -2,8 +2,9 @@
 // to expressions.
 
 use crate::backend::{Backend, Token};
-use crate::frontend::{Frontend, Result, Rule};
+use crate::frontend::{Frontend, Rule};
 use crate::Slot;
+use anyhow::Result;
 use pest::iterators::Pair;
 use std::collections::HashSet;
 use std::str::FromStr;
@@ -79,7 +80,7 @@ impl Expr {
             Expr::And(terms) => terms.iter().any(|c| c.is_aggregating(aggregating_funcs)),
             Expr::Or(terms) => terms.iter().any(|c| c.is_aggregating(aggregating_funcs)),
             Expr::Bool(_) => false,
-            Expr::BinaryOp { left, right, op: _ } => {
+            Expr::BinaryOp { left, right, .. } => {
                 left.is_aggregating(aggregating_funcs) | right.is_aggregating(aggregating_funcs)
             }
             Expr::HasLabel(_, _) => false,
@@ -127,11 +128,11 @@ fn plan_term<T: Backend>(fe: &mut Frontend<T>, term: Pair<Rule>) -> Result<Expr>
                 .next()
                 .expect("Strings should always have an inner value")
                 .as_str();
-            return Ok(Expr::String(String::from(content)));
+            Ok(Expr::String(String::from(content)))
         }
         Rule::id => {
             let tok = fe.tokenize(term.as_str());
-            return Ok(Expr::Slot(fe.get_or_alloc_slot(tok)));
+            Ok(Expr::Slot(fe.get_or_alloc_slot(tok)))
         }
         Rule::prop_lookup => {
             let mut prop_lookup = term.into_inner();
@@ -149,7 +150,7 @@ fn plan_term<T: Backend>(fe: &mut Frontend<T>, term: Pair<Rule>) -> Result<Expr>
                     props.push(fe.tokenize(p_inner.as_str()));
                 }
             }
-            return Ok(Expr::Prop(Box::new(base), props));
+            Ok(Expr::Prop(Box::new(base), props))
         }
         Rule::func_call => {
             let mut func_call = term.into_inner();
@@ -162,7 +163,7 @@ fn plan_term<T: Backend>(fe: &mut Frontend<T>, term: Pair<Rule>) -> Result<Expr>
             for arg in func_call {
                 args.push(plan_expr(fe, arg)?);
             }
-            return Ok(Expr::FuncCall { name, args });
+            Ok(Expr::FuncCall { name, args })
         }
         Rule::list => {
             let mut items = Vec::new();
@@ -170,18 +171,18 @@ fn plan_term<T: Backend>(fe: &mut Frontend<T>, term: Pair<Rule>) -> Result<Expr>
             for exp in exprs {
                 items.push(plan_expr(fe, exp)?);
             }
-            return Ok(Expr::List(items));
+            Ok(Expr::List(items))
         }
         Rule::int => {
             let v = term.as_str().parse::<i64>()?;
-            return Ok(Expr::Int(v));
+            Ok(Expr::Int(v))
         }
         Rule::float => {
             let v = term.as_str().parse::<f64>()?;
-            return Ok(Expr::Float(v));
+            Ok(Expr::Float(v))
         }
-        Rule::lit_true => return Ok(Expr::Bool(true)),
-        Rule::lit_false => return Ok(Expr::Bool(false)),
+        Rule::lit_true => Ok(Expr::Bool(true)),
+        Rule::lit_false => Ok(Expr::Bool(false)),
         Rule::binary_op => {
             let mut parts = term.into_inner();
             let left = parts.next().expect("binary operators must have a left arg");
@@ -194,15 +195,15 @@ fn plan_term<T: Backend>(fe: &mut Frontend<T>, term: Pair<Rule>) -> Result<Expr>
 
             let left_expr = plan_term(fe, left)?;
             let right_expr = plan_term(fe, right)?;
-            return Ok(Expr::BinaryOp {
+            Ok(Expr::BinaryOp {
                 left: Box::new(left_expr),
                 right: Box::new(right_expr),
                 op: Op::from_str(op.as_str())?,
-            });
+            })
         }
         Rule::expr => {
             // this happens when there are parenthetises forcing "full" expressions down here
-            return plan_expr(fe, term);
+            plan_expr(fe, term)
         }
         _ => panic!("({:?}): {}", term.as_rule(), term.as_str()),
     }

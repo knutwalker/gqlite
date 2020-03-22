@@ -314,11 +314,11 @@ fn plan_unwind<T: Backend>(
     );
     let alias = fe.get_or_alloc_slot(alias_token);
 
-    return Ok(LogicalPlan::Unwind {
+    Ok(LogicalPlan::Unwind {
         src: Box::new(src),
         list_expr,
         alias,
-    });
+    })
 }
 
 fn plan_return<T: Backend>(
