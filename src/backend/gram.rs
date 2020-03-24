@@ -175,8 +175,7 @@ impl GramBackend {
             frontend::Expr::String(v) => Expr::Lit(Val::String(v)),
             frontend::Expr::Int(v) => Expr::Lit(Val::Int(v)),
             frontend::Expr::Float(v) => Expr::Lit(Val::Float(v)),
-
-            frontend::Expr::Prop(e, props) => Expr::Prop(Box::new(self.convert_expr(*e)), props),
+            frontend::Expr::Prop(s, props) => Expr::Prop(Box::new(Expr::Slot(s)), props),
             frontend::Expr::Slot(s) => Expr::Slot(s),
             frontend::Expr::List(es) => {
                 let mut items = Vec::with_capacity(es.len());

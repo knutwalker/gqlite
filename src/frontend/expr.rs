@@ -49,7 +49,7 @@ pub enum Expr {
     List(Vec<Expr>),
 
     // Lookup a property by id
-    Prop(Box<Self>, Vec<Token>),
+    Prop(Slot, Vec<Token>),
     Slot(Slot),
     FuncCall {
         name: Token,
@@ -64,7 +64,7 @@ impl Expr {
     // Does this expression - when considered recursively - aggregate rows?
     pub fn is_aggregating(&self, aggregating_funcs: &HashSet<Token>) -> bool {
         match self {
-            Expr::Prop(c, _) => c.is_aggregating(aggregating_funcs),
+            Expr::Prop(_, _) => false,
             Expr::Slot(_) => false,
             Expr::Float(_) => false,
             Expr::Int(_) => false,
@@ -140,7 +140,7 @@ fn plan_term<T: Backend>(fe: &mut Frontend<T>, term: Pair<Rule>) -> Result<Expr>
             let base = match prop_lookup_expr.as_rule() {
                 Rule::id => {
                     let tok = fe.tokenize(prop_lookup_expr.as_str());
-                    Expr::Slot(fe.get_or_alloc_slot(tok))
+                    fe.get_or_alloc_slot(tok)
                 }
                 _ => unreachable!(),
             };
@@ -150,7 +150,7 @@ fn plan_term<T: Backend>(fe: &mut Frontend<T>, term: Pair<Rule>) -> Result<Expr>
                     props.push(fe.tokenize(p_inner.as_str()));
                 }
             }
-            Ok(Expr::Prop(Box::new(base), props))
+            Ok(Expr::Prop(base, props))
         }
         Rule::func_call => {
             let mut func_call = term.into_inner();

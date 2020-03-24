@@ -16,7 +16,7 @@ use std::fmt::Debug;
 mod expr;
 
 use expr::plan_expr;
-pub use expr::{Expr, MapEntryExpr};
+pub use expr::{Expr, Op, MapEntryExpr};
 
 #[derive(Parser)]
 #[grammar = "cypher.pest"]
@@ -1126,12 +1126,12 @@ mod tests {
                         }),
                         grouping: vec![
                             (
-                                Expr::Prop(Box::new(Expr::Slot(p.slot(id_n))), vec![key_age]),
+                                Expr::Prop(p.slot(id_n), vec![key_age]),
                                 p.slot(col_n_age)
                             ),
                             (
                                 Expr::Prop(
-                                    Box::new(Expr::Slot(p.slot(id_n))),
+                                    p.slot(id_n),
                                     vec![key_occupation]
                                 ),
                                 p.slot(col_n_occupation)
