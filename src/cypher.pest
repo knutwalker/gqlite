@@ -34,11 +34,11 @@ bool = _{ lit_true | lit_false }
 lit_true = { ^"TRUE" }
 lit_false = { ^"FALSE" }
 
-int = {
+int = ${
     "-"? ~ ( "0" | ASCII_NONZERO_DIGIT ~ ASCII_DIGIT* )
 }
 
-float = {
+float = ${
    "-"? ~ ( "0" | ASCII_NONZERO_DIGIT ~ ASCII_DIGIT* ) ~ "." ~ ASCII_DIGIT*
 }
 
