@@ -10,7 +10,7 @@ op = { "=" }
 
 atom = _{ bool | float | int | prop_lookup | func_call | string | id | list | "(" ~ expr ~ ")" }
 
-id = ${ ( ASCII_ALPHA | "_" | "-" ) + }
+id = @{ ( ASCII_ALPHA | "_" | "-" )+ }
 
 prop_lookup = { id ~ ("." ~ id)+ }
 
@@ -72,7 +72,20 @@ where_clause = { "WHERE" ~ expr }
 create_stmt = { "CREATE" ~ pattern }
 match_stmt = { "MATCH" ~ pattern ~ where_clause? }
 unwind_stmt = { "UNWIND" ~ expr ~ "AS" ~ id }
+
+with_stmt = { "WITH" ~ projections }
 return_stmt = { "RETURN" ~ projections }
 
-statement = _{ create_stmt | match_stmt | unwind_stmt }
-query = { SOI ~ ( statement )* ~ return_stmt? ~ EOI }
+reading_clause = _{ match_stmt | unwind_stmt }
+writing_clause = _{ create_stmt }
+
+single_query = _{
+  (reading_clause* ~ return_stmt) |
+  (reading_clause* ~ writing_clause+ ~ return_stmt?)
+}
+
+multi_query = _{
+  (reading_clause* ~ writing_clause* ~ with_stmt)* ~ single_query
+}
+
+query = { SOI ~ ( single_query | multi_query ) ~ EOI }

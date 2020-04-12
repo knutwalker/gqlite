@@ -141,6 +141,7 @@ impl GramBackend {
                     print_header: true,
                 }))
             }
+            LogicalPlan::With { .. } => todo!("WITH not yet implemented on gram backend"),
         }
     }
 

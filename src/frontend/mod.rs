@@ -16,7 +16,7 @@ use std::fmt::Debug;
 mod expr;
 
 use expr::plan_expr;
-pub use expr::{Expr, Op, MapEntryExpr};
+pub use expr::{Expr, MapEntryExpr, Op};
 
 #[derive(Parser)]
 #[grammar = "cypher.pest"]
@@ -75,6 +75,9 @@ impl<'a, T: Backend> Frontend<'a, T> {
                 }
                 Rule::return_stmt => {
                     plan = plan_return(self, plan, stmt)?;
+                }
+                Rule::with_stmt => {
+                    plan = plan_with(self, plan, stmt)?;
                 }
                 Rule::EOI => (),
                 _ => unreachable!(),
@@ -178,6 +181,10 @@ pub enum LogicalPlan {
         list_expr: Expr,
         alias: Slot,
     },
+    With {
+        src: Box<Self>,
+        projections: Vec<Projection>,
+    },
     Return {
         src: Box<Self>,
         projections: Vec<Projection>,
@@ -219,11 +226,22 @@ pub enum Predicate {
     HasLabel(Token),
 }
 
-#[derive(Debug, PartialEq)]
+#[derive(Debug, PartialEq, Clone)]
 pub struct Projection {
     pub expr: Expr,
     pub alias: Token,
     pub dst: Slot,
+}
+
+impl Projection {
+    #[cfg(test)]
+    fn project(slot: Slot, token: Token) -> Self {
+        Projection {
+            expr: Expr::Slot(slot),
+            alias: token,
+            dst: slot,
+        }
+    }
 }
 
 fn plan_create<T: Backend>(
@@ -326,18 +344,40 @@ fn plan_return<T: Backend>(
     src: LogicalPlan,
     return_stmt: Pair<Rule>,
 ) -> Result<LogicalPlan> {
-    let mut parts = return_stmt.into_inner();
+    let (src, projections) = plan_return_or_with(fe, src, return_stmt, "RETURN")?;
+    Ok(LogicalPlan::Return {
+        src: Box::new(src),
+        projections,
+    })
+}
+
+fn plan_with<T: Backend>(
+    fe: &mut Frontend<T>,
+    src: LogicalPlan,
+    with_stmt: Pair<Rule>,
+) -> Result<LogicalPlan> {
+    let (src, projections) = plan_return_or_with(fe, src, with_stmt, "WITH")?;
+    Ok(LogicalPlan::With {
+        src: Box::new(src),
+        projections,
+    })
+}
+
+fn plan_return_or_with<T: Backend>(
+    fe: &mut Frontend<T>,
+    src: LogicalPlan,
+    stmt: Pair<Rule>,
+    clause: &'static str,
+) -> Result<(LogicalPlan, Vec<Projection>)> {
+    let mut parts = stmt.into_inner();
     let backend_desc = fe.backend.describe()?;
 
     let (is_aggregate, projections) = parts
         .next()
-        .map(|p| plan_return_projections(fe, &backend_desc, p))
-        .expect("RETURN must start with projections")?;
+        .map(|p| plan_return_or_with_projections(fe, &backend_desc, p))
+        .expect(&format!("{} must start with projections", clause))?;
     if !is_aggregate {
-        return Ok(LogicalPlan::Return {
-            src: Box::new(src),
-            projections,
-        });
+        return Ok((src, projections));
     }
 
     // Split the projections into groupings and aggregating projections, so in a statement like
@@ -368,18 +408,16 @@ fn plan_return<T: Backend>(
         }
     }
 
-    Ok(LogicalPlan::Return {
-        src: Box::new(LogicalPlan::Aggregate {
-            src: Box::new(src),
-            grouping,
-            aggregations,
-        }),
-        projections: aggregation_projections,
-    })
+    let src = LogicalPlan::Aggregate {
+        src: Box::new(src),
+        grouping,
+        aggregations,
+    };
+    Ok((src, aggregation_projections))
 }
 
 // The bool return here is nasty, refactor, maybe make into a struct?
-fn plan_return_projections<T: Backend>(
+fn plan_return_or_with_projections<T: Backend>(
     fe: &mut Frontend<T>,
     backend_desc: &BackendDesc,
     projections: Pair<Rule>,
@@ -388,7 +426,7 @@ fn plan_return_projections<T: Backend>(
     let mut contains_aggregations = false;
     for projection in projections.into_inner() {
         if let Rule::projection = projection.as_rule() {
-            let default_alias = projection.as_str();
+            let default_alias = projection.as_str().trim();
             let mut parts = projection.into_inner();
             let expr = parts.next().map(|p| plan_expr(fe, p)).unwrap()?;
             contains_aggregations =
@@ -505,12 +543,20 @@ fn plan_match<T: Backend>(
     plan: LogicalPlan,
     match_stmt: Pair<Rule>,
 ) -> Result<LogicalPlan> {
+    let provided_tokens = match &plan {
+        LogicalPlan::With { projections, .. } => projections
+            .iter()
+            .map(|p| (p.alias, p.dst))
+            .collect::<HashMap<_, _>>(),
+        _ => HashMap::new(),
+    };
+
     let pg = parse_pattern_graph(fe, match_stmt)?;
     log::debug!("built pg: {:?}", pg);
     // Ok, now we have parsed the pattern into a full graph, time to start solving it
     // If we have relationships, we go by the expand with the smallest cost
     if !pg.e.is_empty() {
-        return plan_match_with_rels(fe, plan, pg);
+        return plan_match_with_rels(fe, plan, &provided_tokens, pg);
     }
     // If the match is empty, we do nothing
     if pg.v.is_empty() {
@@ -526,6 +572,10 @@ fn plan_match<T: Backend>(
         .iter()
         .flat_map(|node_index| {
             let p: &PatternNode = pg.v.get(node_index).unwrap();
+            if provided_tokens.contains_key(&p.identifier) {
+                let cost = EstimatedCost::Scan(0);
+                return vec![(cost, *node_index, None)];
+            }
             if p.labels.is_empty() {
                 let cost = fe.backend.estimate_scan(None);
                 vec![(cost, *node_index, None)]
@@ -545,10 +595,13 @@ fn plan_match<T: Backend>(
 
     let mut nodes = nodes.into_iter();
     let (_, node_id, node_label) = nodes.next().unwrap();
-    let plan = LogicalPlan::NodeScan {
-        src: Box::new(plan),
-        slot: fe.get_or_alloc_slot(node_id),
-        labels: node_label,
+    let plan = match provided_tokens.get(&node_id) {
+        Some(_) => plan,
+        None => LogicalPlan::NodeScan {
+            src: Box::new(plan),
+            slot: fe.get_or_alloc_slot(node_id),
+            labels: node_label,
+        },
     };
 
     let plan = nodes.try_fold(plan, |src, (_, node_id, node_label)| {
@@ -567,6 +620,7 @@ fn plan_match<T: Backend>(
 fn plan_match_with_rels<T: Backend>(
     fe: &mut Frontend<T>,
     plan: LogicalPlan,
+    provided_tokens: &HashMap<Token, Slot>,
     mut pg: PatternGraph,
 ) -> Result<LogicalPlan> {
     // We create pairs of "half expands" and ask the backend to estimate the cost for expanding those.
@@ -584,7 +638,11 @@ fn plan_match_with_rels<T: Backend>(
                         .and_then(|n| n.labels.first())
                         .copied();
                 let dir = p.dir;
-                let cost = fe.backend.estimate_expand(label, rel_type, dir);
+                let cost = if provided_tokens.contains_key(&p.left_node) {
+                    EstimatedCost::Scan(0)
+                } else {
+                    fe.backend.estimate_expand(label, rel_type, dir)
+                };
                 let left = PossibleExpand {
                     label,
                     rel_type,
@@ -594,19 +652,24 @@ fn plan_match_with_rels<T: Backend>(
                     node_index: p.left_node,
                     other_node_index: p.right_node.unwrap(),
                 };
+                let right_node = p.right_node.unwrap();
                 let label =
-                    pg.v.get(&p.right_node.unwrap())
+                    pg.v.get(&right_node)
                         .and_then(|n| n.labels.first())
                         .copied();
                 let dir = dir.map(|d| d.reverse());
-                let cost = fe.backend.estimate_expand(label, rel_type, dir);
+                let cost = if provided_tokens.contains_key(&right_node) {
+                    EstimatedCost::Scan(0)
+                } else {
+                    fe.backend.estimate_expand(label, rel_type, dir)
+                };
                 let right = PossibleExpand {
                     label,
                     rel_type,
                     rel_index,
                     dir,
                     cost,
-                    node_index: p.right_node.unwrap(),
+                    node_index: right_node,
                     other_node_index: p.left_node,
                 };
                 vec![left, right]
@@ -621,11 +684,17 @@ fn plan_match_with_rels<T: Backend>(
     let node_index = lowest_cost_expand.node_index;
     let node = pg.v.get_mut(&node_index).unwrap();
     node.solved = true;
-    let src = fe.get_or_alloc_slot(node_index);
-    let node_scan = LogicalPlan::NodeScan {
-        src: Box::new(plan),
-        slot: src,
-        labels: node.labels.first().copied(),
+    let (src_slot, src_plan) = match provided_tokens.get(&node_index) {
+        Some(slot) => (*slot, plan),
+        None => {
+            let src = fe.get_or_alloc_slot(node_index);
+            let node_scan = LogicalPlan::NodeScan {
+                src: Box::new(plan),
+                slot: src,
+                labels: node.labels.first().copied(),
+            };
+            (src, node_scan)
+        }
     };
 
     // finish the expand to the other node of that particular half
@@ -637,8 +706,8 @@ fn plan_match_with_rels<T: Backend>(
     let dst = fe.get_or_alloc_slot(other_node_index);
 
     let expand = LogicalPlan::Expand {
-        src: Box::new(node_scan),
-        src_slot: src,
+        src: Box::new(src_plan),
+        src_slot,
         rel_slot: fe.get_or_alloc_slot(rel.identifier),
         dst_slot: dst,
         rel_type: rel.rel_type,
@@ -993,7 +1062,7 @@ mod tests {
 
     impl PlanArtifacts {
         fn slot(&self, k: Token) -> usize {
-            self.slots[&k]
+            self.slots.get(&k).copied().unwrap_or(usize::max_value())
         }
 
         fn tokenize(&mut self, content: &str) -> Token {
@@ -1031,6 +1100,7 @@ mod tests {
         use crate::frontend::tests::plan;
         use crate::frontend::{Expr, LogicalPlan, Projection};
         use crate::Error;
+        use pretty_assertions::assert_eq;
 
         #[test]
         fn plan_simple_count() -> Result<(), Error> {
@@ -1125,15 +1195,9 @@ mod tests {
                             labels: Some(lbl_person)
                         }),
                         grouping: vec![
+                            (Expr::Prop(p.slot(id_n), vec![key_age]), p.slot(col_n_age)),
                             (
-                                Expr::Prop(p.slot(id_n), vec![key_age]),
-                                p.slot(col_n_age)
-                            ),
-                            (
-                                Expr::Prop(
-                                    p.slot(id_n),
-                                    vec![key_occupation]
-                                ),
+                                Expr::Prop(p.slot(id_n), vec![key_occupation]),
                                 p.slot(col_n_occupation)
                             ),
                         ],
@@ -1172,10 +1236,11 @@ mod tests {
     mod match_ {
         use super::*;
         use crate::frontend::expr::Op;
+        use pretty_assertions::assert_eq;
 
         #[test]
         fn plan_match_with_anonymous_rel_type() -> Result<()> {
-            let mut p = plan("MATCH (n:Person)-->(o)")?;
+            let mut p = plan("MATCH (n:Person)-->(o) RETURN n")?;
             let lbl_person = p.tokenize("Person");
             let id_anon = p.tokenize("AnonRel#0");
             let tpe_anon = p.tokenize("AnonRel#1");
@@ -1184,17 +1249,20 @@ mod tests {
 
             assert_eq!(
                 p.plan,
-                LogicalPlan::Expand {
-                    src: Box::new(LogicalPlan::NodeScan {
-                        src: Box::new(LogicalPlan::Argument),
-                        slot: p.slot(id_n),
-                        labels: Some(lbl_person),
+                LogicalPlan::Return {
+                    src: Box::new(LogicalPlan::Expand {
+                        src: Box::new(LogicalPlan::NodeScan {
+                            src: Box::new(LogicalPlan::Argument),
+                            slot: p.slot(id_n),
+                            labels: Some(lbl_person),
+                        }),
+                        src_slot: p.slot(id_n),
+                        rel_slot: p.slot(id_anon),
+                        dst_slot: p.slot(id_o),
+                        rel_type: RelType::Anon(tpe_anon),
+                        dir: Some(Dir::Out),
                     }),
-                    src_slot: p.slot(id_n),
-                    rel_slot: p.slot(id_anon),
-                    dst_slot: p.slot(id_o),
-                    rel_type: RelType::Anon(tpe_anon),
-                    dir: Some(Dir::Out),
+                    projections: vec![Projection::project(p.slot(id_n), id_n)]
                 }
             );
             Ok(())
@@ -1202,7 +1270,7 @@ mod tests {
 
         #[test]
         fn plan_match_with_selection() -> Result<()> {
-            let mut p = plan("MATCH (n:Person)-[r:KNOWS]->(o:Person)")?;
+            let mut p = plan("MATCH (n:Person)-[r:KNOWS]->(o:Person) RETURN n")?;
             let lbl_person = p.tokenize("Person");
             let tpe_knows = p.tokenize("KNOWS");
             let id_n = p.tokenize("n");
@@ -1211,20 +1279,23 @@ mod tests {
 
             assert_eq!(
                 p.plan,
-                LogicalPlan::Selection {
-                    src: Box::new(LogicalPlan::Expand {
-                        src: Box::new(LogicalPlan::NodeScan {
-                            src: Box::new(LogicalPlan::Argument),
-                            slot: p.slot(id_n),
-                            labels: Some(lbl_person),
+                LogicalPlan::Return {
+                    src: Box::new(LogicalPlan::Selection {
+                        src: Box::new(LogicalPlan::Expand {
+                            src: Box::new(LogicalPlan::NodeScan {
+                                src: Box::new(LogicalPlan::Argument),
+                                slot: p.slot(id_n),
+                                labels: Some(lbl_person),
+                            }),
+                            src_slot: p.slot(id_n),
+                            rel_slot: p.slot(id_r),
+                            dst_slot: p.slot(id_o),
+                            rel_type: RelType::Defined(tpe_knows),
+                            dir: Some(Dir::Out),
                         }),
-                        src_slot: p.slot(id_n),
-                        rel_slot: p.slot(id_r),
-                        dst_slot: p.slot(id_o),
-                        rel_type: RelType::Defined(tpe_knows),
-                        dir: Some(Dir::Out),
+                        predicate: Expr::HasLabel(p.slot(id_o), lbl_person)
                     }),
-                    predicate: Expr::HasLabel(p.slot(id_o), lbl_person)
+                    projections: vec![Projection::project(p.slot(id_n), id_n)]
                 }
             );
             Ok(())
@@ -1232,51 +1303,371 @@ mod tests {
 
         #[test]
         fn plan_match_with_unhoistable_where() -> Result<()> {
-            let mut p = plan("MATCH (n) WHERE true = opaque()")?;
+            let mut p = plan("MATCH (n) WHERE true = opaque() RETURN n")?;
             let id_n = p.tokenize("n");
             let id_opaque = p.tokenize("opaque");
 
             assert_eq!(
                 p.plan,
-                LogicalPlan::Selection {
-                    src: Box::new(LogicalPlan::NodeScan {
-                        src: Box::new(LogicalPlan::Argument),
-                        slot: p.slot(id_n),
-                        labels: None,
-                    }),
-                    predicate: Expr::BinaryOp {
-                        left: Box::new(Expr::Bool(true)),
-                        right: Box::new(Expr::FuncCall {
-                            name: id_opaque,
-                            args: vec![]
+                LogicalPlan::Return {
+                    src: Box::new(LogicalPlan::Selection {
+                        src: Box::new(LogicalPlan::NodeScan {
+                            src: Box::new(LogicalPlan::Argument),
+                            slot: p.slot(id_n),
+                            labels: None,
                         }),
-                        op: Op::Eq
-                    }
+                        predicate: Expr::BinaryOp {
+                            left: Box::new(Expr::Bool(true)),
+                            right: Box::new(Expr::FuncCall {
+                                name: id_opaque,
+                                args: vec![]
+                            }),
+                            op: Op::Eq
+                        }
+                    }),
+                    projections: vec![Projection::project(p.slot(id_n), id_n)]
                 }
             );
             Ok(())
         }
     }
 
-    mod unwind {
-        use crate::frontend::tests::plan;
-        use crate::frontend::{Expr, LogicalPlan};
-        use crate::Error;
+    #[cfg(test)]
+    mod with {
+        use super::*;
+        use pretty_assertions::assert_eq;
 
         #[test]
-        fn plan_unwind() -> Result<(), Error> {
-            let mut p = plan("UNWIND [[1], [2, 1.0]] AS x")?;
+        fn plan_with_no_dependencies() -> Result<()> {
+            let query = r#"
+              MATCH (a)
+              WITH a
+              MATCH (b)
+              RETURN a, b
+            "#;
+            let mut p = plan(query)?;
+            let id_a = p.tokenize("a");
+            let id_b = p.tokenize("b");
 
+            let expected = LogicalPlan::Return {
+                src: Box::new(LogicalPlan::NodeScan {
+                    src: Box::new(LogicalPlan::With {
+                        src: Box::new(LogicalPlan::NodeScan {
+                            src: Box::new(LogicalPlan::Argument),
+                            slot: p.slot(id_a),
+                            labels: None,
+                        }),
+                        projections: vec![Projection::project(p.slot(id_a), id_a)],
+                    }),
+                    slot: p.slot(id_b),
+                    labels: None,
+                }),
+                projections: vec![
+                    Projection::project(p.slot(id_a), id_a),
+                    Projection::project(p.slot(id_b), id_b),
+                ],
+            };
+
+            assert_eq!(p.plan, expected);
+            Ok(())
+        }
+
+        #[test]
+        fn plan_with_pattern_match_and_dependency() -> Result<()> {
+            let query = r#"
+              MATCH (a:A)
+              WITH a
+              MATCH (a)-->(b)
+              RETURN a, b
+            "#;
+            let mut p = plan(query)?;
+            let id_a = p.tokenize("a");
+            let id_b = p.tokenize("b");
+            let id_anon0 = p.tokenize("AnonRel#0");
+            let id_anon1 = p.tokenize("AnonRel#1");
+
+            let expected = LogicalPlan::Return {
+                src: Box::new(LogicalPlan::Expand {
+                    src: Box::new(LogicalPlan::With {
+                        src: Box::new(LogicalPlan::NodeScan {
+                            src: Box::new(LogicalPlan::Argument),
+                            slot: p.slot(id_a),
+                            labels: Some(p.tokenize("A")),
+                        }),
+                        projections: vec![Projection::project(p.slot(id_a), id_a)],
+                    }),
+                    src_slot: p.slot(id_a),
+                    rel_slot: p.slot(id_anon0),
+                    dst_slot: p.slot(id_b),
+                    rel_type: RelType::Anon(id_anon1),
+                    dir: Some(Dir::Out),
+                }),
+                projections: vec![
+                    Projection::project(p.slot(id_a), id_a),
+                    Projection::project(p.slot(id_b), id_b),
+                ],
+            };
+
+            assert_eq!(p.plan, expected);
+            Ok(())
+        }
+
+        #[test]
+        fn plan_with_aliasing_and_selection() -> Result<()> {
+            let query = r#"
+              MATCH (a)
+              WITH a.num AS property
+              MATCH (b)
+              WHERE property = b.num
+              RETURN b
+            "#;
+            let mut p = plan(query)?;
+            let id_a = p.tokenize("a");
+            let id_b = p.tokenize("b");
+            let id_num = p.tokenize("num");
+            let id_prop = p.tokenize("property");
+
+            let expected = LogicalPlan::Return {
+                src: Box::new(LogicalPlan::Selection {
+                    src: Box::new(LogicalPlan::NodeScan {
+                        src: Box::new(LogicalPlan::With {
+                            src: Box::new(LogicalPlan::NodeScan {
+                                src: Box::new(LogicalPlan::Argument),
+                                slot: p.slot(id_a),
+                                labels: None,
+                            }),
+                            projections: vec![Projection {
+                                expr: Expr::Prop(p.slot(id_a), vec![id_num]),
+                                alias: id_prop,
+                                dst: p.slot(id_prop),
+                            }],
+                        }),
+                        slot: p.slot(id_b),
+                        labels: None,
+                    }),
+                    predicate: Expr::BinaryOp {
+                        left: Box::new(Expr::Slot(p.slot(id_prop))),
+                        right: Box::new(Expr::Prop(p.slot(id_b), vec![id_num])),
+                        op: Op::Eq,
+                    },
+                }),
+                projections: vec![Projection::project(p.slot(id_b), id_b)],
+            };
+
+            assert_eq!(p.plan, expected);
+            Ok(())
+        }
+
+        #[test]
+        fn plan_with_multiple_aliases() -> Result<()> {
+            let query = r#"
+              MATCH (a)
+              WITH a.num AS property, a.id AS idToUse
+              MATCH (b)
+              WHERE b.id = idToUse
+              RETURN b
+            "#;
+            let mut p = plan(query)?;
+            let id_a = p.tokenize("a");
+            let id_b = p.tokenize("b");
+            let id_num = p.tokenize("num");
+            let id_id = p.tokenize("id");
+            let id_prop = p.tokenize("property");
+            let id_use = p.tokenize("idToUse");
+
+            let expected = LogicalPlan::Return {
+                src: Box::new(LogicalPlan::Selection {
+                    src: Box::new(LogicalPlan::NodeScan {
+                        src: Box::new(LogicalPlan::With {
+                            src: Box::new(LogicalPlan::NodeScan {
+                                src: Box::new(LogicalPlan::Argument),
+                                slot: p.slot(id_a),
+                                labels: None,
+                            }),
+                            projections: vec![
+                                Projection {
+                                    expr: Expr::Prop(p.slot(id_a), vec![id_num]),
+                                    alias: id_prop,
+                                    dst: p.slot(id_prop),
+                                },
+                                Projection {
+                                    expr: Expr::Prop(p.slot(id_a), vec![id_id]),
+                                    alias: id_use,
+                                    dst: p.slot(id_use),
+                                },
+                            ],
+                        }),
+                        slot: p.slot(id_b),
+                        labels: None,
+                    }),
+                    predicate: Expr::BinaryOp {
+                        left: Box::new(Expr::Prop(p.slot(id_b), vec![id_id])),
+                        right: Box::new(Expr::Slot(p.slot(id_use))),
+                        op: Op::Eq,
+                    },
+                }),
+                projections: vec![Projection::project(p.slot(id_b), id_b)],
+            };
+
+            assert_eq!(p.plan, expected);
+            Ok(())
+        }
+
+        #[test]
+        fn plan_with_aggregation() -> Result<()> {
+            let query = r#"
+              MATCH (a)
+              WITH a.name AS bars, count(a) AS relCount
+              RETURN a, bars, relCount
+            "#;
+            let mut p = plan(query)?;
+            let id_a = p.tokenize("a");
+            let id_name = p.tokenize("name");
+            let id_bars = p.tokenize("bars");
+            let id_count = p.tokenize("count");
+            let id_rel_count = p.tokenize("relCount");
+
+            let expected = LogicalPlan::Return {
+                src: Box::new(LogicalPlan::With {
+                    src: Box::new(LogicalPlan::Aggregate {
+                        src: Box::new(LogicalPlan::NodeScan {
+                            src: Box::new(LogicalPlan::Argument),
+                            slot: p.slot(id_a),
+                            labels: None,
+                        }),
+                        grouping: vec![(Expr::Prop(p.slot(id_a), vec![id_name]), p.slot(id_bars))],
+                        aggregations: vec![(
+                            Expr::FuncCall {
+                                name: id_count,
+                                args: vec![Expr::Slot(p.slot(id_a))],
+                            },
+                            p.slot(id_rel_count),
+                        )],
+                    }),
+                    projections: vec![
+                        Projection::project(p.slot(id_bars), id_bars),
+                        Projection::project(p.slot(id_rel_count), id_rel_count),
+                    ],
+                }),
+                projections: vec![
+                    Projection::project(p.slot(id_a), id_a),
+                    Projection::project(p.slot(id_bars), id_bars),
+                    Projection::project(p.slot(id_rel_count), id_rel_count),
+                ],
+            };
+
+            assert_eq!(p.plan, expected);
+            Ok(())
+        }
+
+        #[test]
+        fn plan_double_with() -> Result<()> {
+            let query = r#"
+              MATCH (a:A)-[r:REL]->(b:B)
+              WITH a AS b, b AS tmp, r AS r
+              WITH b AS a, r
+              MATCH (a)-[r]->(b)
+              RETURN a, r, b
+            "#;
+            let mut p = plan(query)?;
+            let id_a = p.tokenize("a");
+            let id_b = p.tokenize("b");
+            let id_r = p.tokenize("r");
+            let id_tmp = p.tokenize("tmp");
+            let lbl_a = p.tokenize("A");
+            let lbl_b = p.tokenize("B");
+            let tpe_rel = p.tokenize("REL");
+            let tpe_anon = p.tokenize("AnonRel#0");
+
+            let expected = LogicalPlan::Return {
+                src: Box::new(LogicalPlan::Expand {
+                    src: Box::new(LogicalPlan::With {
+                        src: Box::new(LogicalPlan::With {
+                            src: Box::new(LogicalPlan::Selection {
+                                src: Box::new(LogicalPlan::Expand {
+                                    src: Box::new(LogicalPlan::NodeScan {
+                                        src: Box::new(LogicalPlan::Argument),
+                                        slot: p.slot(id_a),
+                                        labels: Some(lbl_a),
+                                    }),
+                                    src_slot: p.slot(id_a),
+                                    rel_slot: p.slot(id_r),
+                                    dst_slot: p.slot(id_b),
+                                    rel_type: RelType::Defined(tpe_rel),
+                                    dir: Some(Dir::Out),
+                                }),
+                                predicate: Expr::HasLabel(p.slot(id_b), lbl_b),
+                            }),
+                            projections: vec![
+                                Projection {
+                                    expr: Expr::Slot(p.slot(id_a)),
+                                    alias: id_b,
+                                    dst: p.slot(id_b),
+                                },
+                                Projection {
+                                    expr: Expr::Slot(p.slot(id_b)),
+                                    alias: id_tmp,
+                                    dst: p.slot(id_tmp),
+                                },
+                                Projection {
+                                    expr: Expr::Slot(p.slot(id_r)),
+                                    alias: id_r,
+                                    dst: p.slot(id_r),
+                                },
+                            ],
+                        }),
+                        projections: vec![
+                            Projection {
+                                expr: Expr::Slot(p.slot(id_b)),
+                                alias: id_a,
+                                dst: p.slot(id_a),
+                            },
+                            Projection {
+                                expr: Expr::Slot(p.slot(id_r)),
+                                alias: id_r,
+                                dst: p.slot(id_r),
+                            },
+                        ],
+                    }),
+                    src_slot: p.slot(id_a),
+                    rel_slot: p.slot(id_r),
+                    dst_slot: p.slot(id_b),
+                    rel_type: RelType::Anon(tpe_anon),
+                    dir: Some(Dir::Out),
+                }),
+                projections: vec![
+                    Projection::project(p.slot(id_a), id_a),
+                    Projection::project(p.slot(id_r), id_r),
+                    Projection::project(p.slot(id_b), id_b),
+                ],
+            };
+
+            assert_eq!(p.plan, expected);
+            Ok(())
+        }
+    }
+
+    mod unwind {
+        use super::*;
+        use pretty_assertions::assert_eq;
+
+        #[test]
+        fn plan_unwind() -> Result<()> {
+            let mut p = plan("UNWIND [[1], [2, 1.0]] AS x RETURN x")?;
             let id_x = p.tokenize("x");
+
             assert_eq!(
                 p.plan,
-                LogicalPlan::Unwind {
-                    src: Box::new(LogicalPlan::Argument),
-                    list_expr: Expr::List(vec![
-                        Expr::List(vec![Expr::Int(1)]),
-                        Expr::List(vec![Expr::Int(2), Expr::Float(1.0)]),
-                    ]),
-                    alias: p.slot(id_x),
+                LogicalPlan::Return {
+                    src: Box::new(LogicalPlan::Unwind {
+                        src: Box::new(LogicalPlan::Argument),
+                        list_expr: Expr::List(vec![
+                            Expr::List(vec![Expr::Int(1)]),
+                            Expr::List(vec![Expr::Int(2), Expr::Float(1.0)]),
+                        ]),
+                        alias: p.slot(id_x),
+                    }),
+                    projections: vec![Projection::project(p.slot(id_x), id_x)]
                 }
             );
             Ok(())
@@ -1288,6 +1679,7 @@ mod tests {
         use crate::frontend::tests::plan;
         use crate::frontend::{Expr, LogicalPlan, MapEntryExpr, NodeSpec, RelSpec, RelType};
         use crate::Error;
+        use pretty_assertions::assert_eq;
 
         #[test]
         fn plan_create() -> Result<(), Error> {
