@@ -774,7 +774,7 @@ impl Operator for Unwind {
 }
 
 mod parser {
-    use super::Val;    
+    use super::Val;
     use crate::backend::gram::{Graph, Node, Tokens};
     use crate::backend::Token;
     use crate::pest::Parser;
