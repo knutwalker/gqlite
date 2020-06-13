@@ -238,18 +238,16 @@ mod tests {
         let plan = pc.plan_in_context(&format!("RETURN {}", q));
         let slots = pc.slots;
 
-        if let Ok(LogicalPlan::Return {
-            src: _,
-            projections,
-        }) = plan
-        {
-            return Ok(PlanArtifacts {
+        match plan {
+            Ok(LogicalPlan::Return {
+                src: _,
+                projections,
+            }) => Ok(PlanArtifacts {
                 backend,
                 expr: projections[0].expr.clone(),
                 slots,
-            });
-        } else {
-            return Err(anyhow!("Expected RETURN plan, got: {:?}", plan?));
+            }),
+            _ => Err(anyhow!("Expected RETURN plan, got: {:?}", plan?)),
         }
     }
 

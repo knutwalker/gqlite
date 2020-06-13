@@ -375,7 +375,7 @@ fn plan_return_or_with<T: Backend>(
     let (is_aggregate, projections) = parts
         .next()
         .map(|p| plan_return_or_with_projections(fe, &backend_desc, p))
-        .expect(&format!("{} must start with projections", clause))?;
+        .unwrap_or_else(|| panic!("{} must start with projections", clause))?;
     if !is_aggregate {
         return Ok((src, projections));
     }
@@ -982,7 +982,9 @@ fn parse_map_expression<T: Backend>(
 #[cfg(test)]
 mod test_backend {
     use super::*;
-    use crate::backend::{BackendCursor, BackendDesc, CostEstimation, FuncSignature, FuncType, Token, Tokens};
+    use crate::backend::{
+        BackendCursor, BackendDesc, CostEstimation, FuncSignature, FuncType, Token, Tokens,
+    };
     use crate::{Row, Type};
     use anyhow::Result;
     use std::cell::RefCell;
@@ -1018,9 +1020,7 @@ mod test_backend {
     impl Backend for TestBackend {
         type Cursor = ();
 
-        fn new_cursor(&mut self) -> Self::Cursor {
-            ()
-        }
+        fn new_cursor(&mut self) -> Self::Cursor {}
 
         fn tokenize(&mut self, contents: &str) -> usize {
             self.tokens.borrow_mut().tokenize(contents)

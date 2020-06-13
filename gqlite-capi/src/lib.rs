@@ -110,7 +110,7 @@ pub unsafe extern "C" fn gqlite_run(
 #[no_mangle]
 pub unsafe extern "C" fn gqlite_cursor_next(raw_cursor: *mut cursor) -> c_int {
     let cursor = &mut *raw_cursor;
-    match cursor.cursor.next() {
+    match cursor.cursor.try_next() {
         Ok(_) => 0,
         Err(e) => {
             println!("ERR: {:?}", e);

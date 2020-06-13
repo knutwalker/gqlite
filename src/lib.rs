@@ -70,7 +70,7 @@ pub struct Cursor<B: Backend> {
 }
 
 impl<B: Backend> Cursor<B> {
-    pub fn next(&mut self) -> Result<Option<&Row>> {
+    pub fn try_next(&mut self) -> Result<Option<&Row>> {
         self.inner.next()
     }
 }

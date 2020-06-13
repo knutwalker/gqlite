@@ -40,7 +40,7 @@ fn main() -> anyhow::Result<()> {
         let mut cursor = db.new_cursor();
         db.run(query_str, &mut cursor)?;
 
-        while let Some(_) = cursor.next()? {}
+        while cursor.try_next()?.is_some() {}
     }
 
     Ok(())

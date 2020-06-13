@@ -6,7 +6,9 @@
 // It is currently single threaded, and provides no data durability guarantees.
 
 use crate::backend::gram::functions::AggregatingFuncSpec;
-use crate::backend::{Backend, BackendCursor, BackendDesc, CostEstimation, EstimatedCost, Token, Tokens};
+use crate::backend::{
+    Backend, BackendCursor, BackendDesc, CostEstimation, EstimatedCost, Token, Tokens,
+};
 use crate::frontend::{Dir, FrontendPlan, LogicalPlan};
 use crate::{frontend, Error, Row, Slot, Val};
 use anyhow::Result;
@@ -156,7 +158,7 @@ impl GramBackend {
                     for a in args {
                         arguments.push(self.convert_expr(a));
                     }
-                    return f.init(arguments);
+                    f.init(arguments)
                 } else {
                     panic!(
                         "The gram backend doesn't support nesting regular functions with aggregates yet: {:?}",
@@ -394,7 +396,7 @@ impl GramVal {
                 for i in 0..vs.len() {
                     out[i] = vs[i].project(ctx);
                 }
-                return Val::List(out);
+                Val::List(out)
             }
             GramVal::Node { id } => {
                 let n = &ctx.g.borrow().nodes[*id];
@@ -405,11 +407,11 @@ impl GramVal {
                         v.clone(),
                     ));
                 }
-                return Val::Node(crate::Node {
+                Val::Node(crate::Node {
                     id: *id,
                     labels: vec![],
                     props,
-                });
+                })
             }
             _ => panic!("don't know how to project: {:?}", self),
         }
@@ -466,15 +468,11 @@ impl PartialOrd for GramVal {
                 GramVal::Lit(Val::String(_)) => Some(Ordering::Less),
                 GramVal::Lit(Val::Int(_)) => Some(Ordering::Less),
                 GramVal::Lit(Val::Float(_)) => Some(Ordering::Less),
-                GramVal::List(other_vs) => {
-                    return self_v.partial_cmp(&other_vs);
-                }
+                GramVal::List(other_vs) => self_v.partial_cmp(&other_vs),
                 GramVal::Lit(Val::Null) => None,
                 _ => panic!("Don't know how to compare {:?} to {:?}", self, other),
             },
-            GramVal::Lit(Val::Null) => match other {
-                _ => None,
-            },
+            GramVal::Lit(Val::Null) => None,
             _ => panic!("Don't know how to compare {:?} to {:?}", self, other),
         }
     }
@@ -613,7 +611,7 @@ impl Operator for Argument {
             return Ok(false);
         }
         self.consumed = true;
-        return Ok(true);
+        Ok(true)
     }
 }
 
@@ -638,7 +636,7 @@ impl Operator for Create {
                 .iter()
                 .map(|p| {
                     if let Ok(GramVal::Lit(val)) = p.1.eval(ctx, out) {
-                        return (*p.0, (val));
+                        (*p.0, (val))
                     } else {
                         panic!("Property creation expression yielded non-literal?")
                     }
@@ -730,7 +728,7 @@ impl Operator for Aggregate {
         }
 
         self.consumed = true;
-        return Ok(true);
+        Ok(true)
     }
 }
 
@@ -1078,7 +1076,7 @@ mod functions {
         let mut out: Vec<Box<dyn AggregatingFuncSpec>> = Default::default();
         out.push(Box::new(MinSpec::new(tokens)));
         out.push(Box::new(MaxSpec::new(tokens)));
-        return out;
+        out
     }
 
     pub(super) trait AggregatingFuncSpec: Debug {
@@ -1113,7 +1111,7 @@ mod functions {
 
     impl AggregatingFuncSpec for MinSpec {
         fn signature(&self) -> &FuncSignature {
-            return &self.sig;
+            &self.sig
         }
 
         fn init(&self, mut args: Vec<Expr>) -> Box<dyn AggregatingFunc> {
@@ -1148,7 +1146,7 @@ mod functions {
 
         fn complete(&mut self) -> Result<&GramVal> {
             if let Some(v) = &self.min {
-                return Ok(v);
+                Ok(v)
             } else {
                 Err(anyhow!(
                     "There were no input rows to the aggregation, cannot calculate min(..)"
@@ -1178,7 +1176,7 @@ mod functions {
 
     impl AggregatingFuncSpec for MaxSpec {
         fn signature(&self) -> &FuncSignature {
-            return &self.sig;
+            &self.sig
         }
 
         fn init(&self, mut args: Vec<Expr>) -> Box<dyn AggregatingFunc> {
@@ -1214,7 +1212,7 @@ mod functions {
 
         fn complete(&mut self) -> Result<&GramVal> {
             if let Some(v) = &self.max {
-                return Ok(v);
+                Ok(v)
             } else {
                 Err(anyhow!(
                     "There were no input rows to the aggregation, cannot calculate min(..)"

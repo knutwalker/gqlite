@@ -109,7 +109,7 @@ mod example_steps {
     fn run_preparatory_query(world: &mut MyWorld, step: &Step) -> Result<(), Error> {
         let mut cursor = world.graph.new_cursor();
         let result = world.graph.run(&step.docstring().unwrap(), &mut cursor);
-        while let Some(_) = cursor.next()? {
+        while cursor.try_next()?.is_some() {
             // consume
         }
         world.starting_graph_properties.node_count = count_nodes(world);
@@ -125,7 +125,7 @@ mod example_steps {
 
     fn count_rows(result: &mut GramCursor) -> Result<i32, Error> {
         let mut ct = 0;
-        while let Some(_) = result.next()? {
+        while result.try_next()?.is_some() {
             ct += 1
         }
         Ok(ct)
@@ -159,11 +159,10 @@ mod example_steps {
 
     fn assert_result(world: &mut MyWorld, step: &Step) {
         let table = step.table().unwrap().clone();
-        for mut row in table.rows {
-            if let Ok(Some(actual)) = world.result.next() {
-                for slot in 0..row.len() {
-                    str_to_val(&mut row[slot].chars().peekable())
-                        .assert_eq(actual.slots[slot].clone());
+        for row in table.rows {
+            if let Ok(Some(actual)) = world.result.try_next() {
+                for (slot, r) in row.into_iter().enumerate() {
+                    str_to_val(&mut r.chars().peekable()).assert_eq(actual.slots[slot].clone());
                 }
             } else {
                 assert_eq!(false, true, "Expected more results");
@@ -195,7 +194,7 @@ mod example_steps {
             if is_float {
                 return ValMatcher::Float(val.parse().unwrap());
             }
-            return ValMatcher::Int(val.parse().unwrap());
+            ValMatcher::Int(val.parse().unwrap())
         }
         fn parse_identifier(chars: &mut Peekable<Chars>) -> String {
             let mut id = String::new();
@@ -210,7 +209,7 @@ mod example_steps {
                     _ => break,
                 }
             }
-            return id;
+            id
         }
 
         loop {
@@ -230,7 +229,6 @@ mod example_steps {
                 }
                 ' ' => {
                     chars.next().unwrap();
-                    ()
                 }
                 '[' => {
                     let mut items = Vec::new();
@@ -241,11 +239,9 @@ mod example_steps {
                             None => return ValMatcher::List(items),
                             Some(',') => {
                                 chars.next().unwrap();
-                                ()
                             }
                             Some(' ') => {
                                 chars.next().unwrap();
-                                ()
                             }
                             _ => items.push(str_to_val(&mut chars)),
                         }
@@ -270,7 +266,6 @@ mod example_steps {
                                 }
                                 Some(' ') => {
                                     chars.next().unwrap();
-                                    ()
                                 }
                                 _ => panic!(format!("unknown map portion: '{:?}'", chars)),
                             }
@@ -288,18 +283,14 @@ mod example_steps {
                         match chars.peek() {
                             Some(')') => return ValMatcher::Node { props },
                             None => return ValMatcher::Node { props },
-                            Some('{') => {
-                                match str_to_val(&mut chars) {
-                                    ValMatcher::Map(e) => {
-                                        props = e;
-                                    }
-                                    v => panic!("Expected property map, got {:?}", v),
+                            Some('{') => match str_to_val(&mut chars) {
+                                ValMatcher::Map(e) => {
+                                    props = e;
                                 }
-                                ()
-                            }
+                                v => panic!("Expected property map, got {:?}", v),
+                            },
                             Some(' ') => {
                                 chars.next().unwrap();
-                                ()
                             }
                             _ => panic!(format!("unknown node spec portion: '{:?}'", chars.peek())),
                         }
