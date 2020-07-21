@@ -11,7 +11,7 @@ use crate::backend::{
 };
 use crate::frontend::{Dir, FrontendPlan, LogicalPlan};
 use crate::{frontend, Error, Row, Slot, Val};
-use anyhow::Result;
+use eyre::Result;
 use rand::Rng;
 use std::cell::RefCell;
 use std::cmp::Ordering;
@@ -777,7 +777,7 @@ mod parser {
     use crate::backend::gram::{Graph, Node, Tokens};
     use crate::backend::Token;
     use crate::pest::Parser;
-    use anyhow::Result;
+    use eyre::Result;
     use std::collections::HashMap;
     use std::collections::HashSet;
     use std::fs::File;

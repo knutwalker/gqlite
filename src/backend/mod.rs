@@ -4,7 +4,7 @@
 //
 use crate::frontend::{Dir, FrontendPlan};
 use crate::{Error, Row, Type};
-use anyhow::Result;
+use eyre::Result;
 use std::collections::{HashMap, HashSet};
 use std::fmt::Debug;
 

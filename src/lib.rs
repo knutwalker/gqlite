@@ -2,12 +2,12 @@ extern crate pest;
 #[macro_use]
 extern crate pest_derive;
 #[macro_use]
-extern crate anyhow;
+extern crate eyre;
 
 pub mod backend;
 pub mod frontend;
 
-pub use anyhow::{Error, Result};
+pub use eyre::{Error, Result};
 use std::fmt::{Debug, Display, Formatter};
 
 use backend::{Backend, BackendCursor};

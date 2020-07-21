@@ -1,4 +1,4 @@
-fn main() -> anyhow::Result<()> {
+fn main() -> eyre::Result<()> {
     #[cfg(all(feature = "cli", feature = "gram"))]
     {
         use clap::{App, AppSettings};

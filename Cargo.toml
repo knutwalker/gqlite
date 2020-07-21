@@ -21,9 +21,9 @@ path = "src/main.rs"
 doc = false
 
 [dependencies]
-anyhow = "1.0"
 clap = { version = "2.33.0", optional = true }
 env_logger = { version = "0.7.1", default_features = false, features = ["atty"], optional = true }
+eyre = "0.6.0"
 json = { version = "0.12", optional = true }
 log = "0.4.8"
 pest = "2.0"

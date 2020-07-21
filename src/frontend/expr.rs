@@ -4,7 +4,7 @@
 use crate::backend::{Backend, Token};
 use crate::frontend::{Frontend, Rule};
 use crate::Slot;
-use anyhow::Result;
+use eyre::Result;
 use pest::iterators::Pair;
 use std::collections::HashSet;
 use std::str::FromStr;
@@ -15,7 +15,7 @@ pub enum Op {
 }
 
 impl FromStr for Op {
-    type Err = anyhow::Error;
+    type Err = eyre::Error;
 
     fn from_str(s: &str) -> Result<Self> {
         match s {

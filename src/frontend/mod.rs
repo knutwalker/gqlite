@@ -7,7 +7,7 @@ use pest::Parser;
 
 use crate::backend::{Backend, BackendDesc, EstimatedCost, Token};
 use crate::Slot;
-use anyhow::Result;
+use eyre::Result;
 use pest::iterators::Pair;
 use std::collections::hash_map::Entry;
 use std::collections::HashMap;
